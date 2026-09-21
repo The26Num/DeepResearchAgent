@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-research-agent"
+version = "0.1.0"
+description = "Phase 1 evidence-centered research agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents>=0.5.4,<1",
+    "langchain>=1,<2",
+    "langgraph>=1,<2",
+    "langchain-openai>=1,<2",
+    "openai>=2.45,<4",
+    "pydantic>=2,<3",
+    "pydantic-settings>=2,<3",
+    "python-dotenv>=1,<2",
+    "ddgs>=9,<10",
+    "requests>=2.32,<3",
+    "beautifulsoup4>=4.12,<5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
