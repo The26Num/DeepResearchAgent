@@ -37,7 +37,7 @@ def test_tasks_run_in_order_and_complete(capsys) -> None:
             seen.append((task.id, task.status, context or {}))
             return execution_for(task)
 
-    result = ResearchOrchestrator(SupervisorStub(), ResearcherStub()).run("topic")
+    result = ResearchOrchestrator(SupervisorStub(), ResearcherStub(), max_concurrency=1).run("topic")
     assert seen == [("T1", "running", {}), ("T2", "running", {})]
     assert [task.status for task in result.plan.tasks] == ["completed", "completed"]
     assert result.memos == {"T1": "Memo for T1", "T2": "Memo for T2"}
@@ -62,7 +62,7 @@ def test_failed_task_stops_and_marks_failed() -> None:
             raise RuntimeError("search unavailable")
 
     with pytest.raises(RuntimeError, match="search unavailable"):
-        ResearchOrchestrator(SupervisorStub(), ResearcherStub()).run("topic")
+        ResearchOrchestrator(SupervisorStub(), ResearcherStub(), max_concurrency=1).run("topic")
     assert [task.status for task in plan.tasks] == ["failed", "pending"]
 
 
@@ -86,7 +86,7 @@ def test_dependency_memos_reach_later_task_even_when_plan_is_out_of_order(capsys
             seen.append((task.id, dict(context or {})))
             return execution_for(task)
 
-    result = ResearchOrchestrator(SupervisorStub(), ResearcherStub()).run("topic")
+    result = ResearchOrchestrator(SupervisorStub(), ResearcherStub(), max_concurrency=1).run("topic")
     assert seen == [
         ("task1", {}),
         ("task2", {}),

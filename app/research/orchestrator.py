@@ -1,3 +1,4 @@
+import asyncio
 from collections import Counter
 from dataclasses import dataclass
 
@@ -6,7 +7,8 @@ from app.agents.supervisor import Supervisor
 from app.llm import create_llm
 from app.research.context import build_dependency_context
 from app.schemas.plan import ResearchPlan, validate_plan_dependencies
-from app.schemas.research_result import CompactResearchResult
+from app.schemas.research_result import CompactResearchResult, ResearchExecutionResult
+from app.schemas.task import ResearchTask
 
 
 @dataclass
@@ -17,16 +19,30 @@ class ResearchResult:
 
 
 class ResearchOrchestrator:
-    def __init__(self, supervisor: Supervisor | None = None, researcher: Researcher | None = None) -> None:
+    def __init__(
+        self, supervisor: Supervisor | None = None, researcher: Researcher | None = None,
+        *, max_concurrency: int = 3,
+    ) -> None:
+        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
+            raise ValueError("max_concurrency must be a positive integer.")
         if supervisor is None or researcher is None:
             model = create_llm()
             supervisor = supervisor or Supervisor(model)
             researcher = researcher or Researcher(model)
         self.supervisor = supervisor
         self.researcher = researcher
+        self.max_concurrency = max_concurrency
 
     def run(self, query: str) -> ResearchResult:
-        plan = self.supervisor.create_plan(query)  #先让supervisor生成一个研究计划
+        """Synchronous entry point for the CLI; async callers should await arun()."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.arun(query))
+        raise RuntimeError("An event loop is already running; use await ResearchOrchestrator.arun(query).")
+
+    async def arun(self, query: str) -> ResearchResult:
+        plan = await asyncio.to_thread(self.supervisor.create_plan, query)
         validate_plan_dependencies(plan)  #对研究计划进行依赖性验证，确保没有循环依赖或未定义的依赖
         if any(task.status != "pending" for task in plan.tasks):  #Supervisor生成的研究计划中的所有任务状态必须是pending，如果不是则抛出异常
             raise ValueError("ResearchPlan tasks must start as pending.")
@@ -40,48 +56,113 @@ class ResearchOrchestrator:
             print(f"任务类型：{task.task_type}")
             print(f"依赖：{', '.join(task.depends_on) or '无'}\n")
 
-        #创建两个结果容器
-        memos: dict[str, str] = {}  
-        compact_results: dict[str, CompactResearchResult] = {}
-
-
+        executions: dict[str, ResearchExecutionResult] = {}
         while pending_tasks := [task for task in plan.tasks if task.status == "pending"]:
-            ready_tasks = [
-                task for task in pending_tasks
-                if all(dependency in compact_results for dependency in task.depends_on)
-            ]
+            ready_tasks = self._get_ready_tasks(plan, executions)
             if not ready_tasks:
                 remaining = ", ".join(task.id for task in pending_tasks)
                 raise RuntimeError(f"No research task is ready; unresolved dependencies for: {remaining}.")
 
-            for task in ready_tasks:
-                #收集dependence结果，注意这里传的是compact_results，因为compact_results是给task2看的，memos是给用户看的
-                dependency_context = {dependency: compact_results[dependency] for dependency in task.depends_on}
-                print("\n" + "=" * 40 + f"\n正在执行 {task.id}\n" + "=" * 40)
-                print(f"任务类型：{task.task_type}")
-                print(f"依赖：{', '.join(task.depends_on) or '无'}")
-                if isinstance(self.researcher, Researcher):
-                    _, context_text = self.researcher.build_request(task, dependency_context, query)
+            batch = ready_tasks[:self.max_concurrency]
+            print(
+                "\n" + "=" * 40
+                + f"\n正在执行批次：{len(batch)} 项任务（并发上限 {self.max_concurrency}）\n"
+                + "=" * 40,
+                flush=True,
+            )
+            # Wait for every worker in this batch, including when a sibling fails.
+            # Cancelling an await on to_thread() cannot stop its synchronous worker.
+            outcomes = await asyncio.gather(
+                *(self._run_task(task, executions, query) for task in batch),
+                return_exceptions=True,
+            )
+            failures: list[tuple[ResearchTask, BaseException]] = []
+            for task, outcome in zip(batch, outcomes):
+                if isinstance(outcome, BaseException):
+                    failures.append((task, outcome))
                 else:
-                    context_text = build_dependency_context(dependency_context)
-                print(f"依赖上下文字符数：{len(context_text)}")
-                task.status = "running"  #切换任务状态为running，表示任务正在执行
-                #让researcher开始执行任务，researcher会根据任务类型和依赖上下文来决定如何执行任务，并返回一个execution对象，包含任务的执行结果
-                try:
-                    execution = self.researcher.research(task=task, context=dependency_context, goal=query)
-                except Exception:
-                    task.status = "failed"
-                    raise   #把异常抛出给上层调用者，表示任务执行失败
-                #如果researcher执行任务成功，则切换任务状态为completed，并将执行结果存入memos和compact_results中
-                task.status = "completed"
-                memos[task.id] = execution.memo
-                compact_results[task.id] = execution.compact
-                #打印执行结果的相关信息，包括工具调用情况和压缩结果的字符数
-                counts = Counter(execution.tools_used)
-                tools_line = ", ".join(f"{name} x{counts[name]}" for name in ("web_search", "fetch_webpage") if counts[name])
-                print(f"工具调用：{tools_line or '无'}")
-                print(f"压缩结果字符数：{len(execution.compact.model_dump_json())}")
-                print("\n" + "=" * 40 + f"\n研究摘要 — {task.id}\n" + "=" * 40)
-                print(execution.memo)
+                    executions[task.id] = outcome
+            if failures:
+                self._print_results(plan, executions)
+                detail = "; ".join(
+                    f"{task.id}: {type(error).__name__}: {error}" for task, error in failures
+                )
+                remaining = ", ".join(task.id for task in plan.tasks if task.status == "pending")
+                if remaining:
+                    print(f"未执行任务：{remaining}（本批次有任务失败，停止后续调度）", flush=True)
+                raise RuntimeError(
+                    f"Research tasks failed: {detail}. Pending tasks not executed: {remaining or 'none'}."
+                ) from failures[0][1]
 
-        return ResearchResult(plan=plan, memos=memos, compact_results=compact_results)
+        self._print_results(plan, executions)
+        return ResearchResult(
+            plan=plan,
+            memos={task.id: executions[task.id].memo for task in plan.tasks},
+            compact_results={task.id: executions[task.id].compact for task in plan.tasks},
+        )
+
+    @staticmethod
+    def _get_ready_tasks(
+        plan: ResearchPlan, executions: dict[str, ResearchExecutionResult],
+    ) -> list[ResearchTask]:
+        tasks_by_id = {task.id: task for task in plan.tasks}
+        return [
+            task for task in plan.tasks
+            if task.status == "pending" and all(
+                tasks_by_id[dependency].status == "completed" and dependency in executions
+                for dependency in task.depends_on
+            )
+        ]
+
+    async def _run_task(
+        self, task: ResearchTask, executions: dict[str, ResearchExecutionResult], query: str,
+    ) -> ResearchExecutionResult:
+        task.status = "running"
+        try:
+            # Isolate mutable compact results even when sibling tasks share dependencies.
+            dependency_context = {
+                dependency: executions[dependency].compact.model_copy(deep=True)
+                for dependency in task.depends_on
+            }
+            if isinstance(self.researcher, Researcher):
+                _, context_text = self.researcher.build_request(task, dependency_context, query)
+            else:
+                context_text = build_dependency_context(dependency_context)
+            print(
+                f"[{task.id}] 正在执行\n"
+                f"[{task.id}] 任务类型：{task.task_type}\n"
+                f"[{task.id}] 依赖：{', '.join(task.depends_on) or '无'}\n"
+                f"[{task.id}] 依赖上下文字符数：{len(context_text)}",
+                flush=True,
+            )
+            execution = await asyncio.to_thread(
+                self.researcher.research, task=task, context=dependency_context, goal=query,
+            )
+        except Exception as error:
+            task.status = "failed"
+            print(f"[{task.id}] failed — {type(error).__name__}: {error}", flush=True)
+            raise
+        task.status = "completed"
+        print(f"[{task.id}] completed", flush=True)
+        return execution
+
+    @staticmethod
+    def _print_results(plan: ResearchPlan, executions: dict[str, ResearchExecutionResult]) -> None:
+        """Print successful memos in the original plan order, regardless of finish order."""
+        for task in plan.tasks:
+            if task.id not in executions:
+                continue
+            execution = executions[task.id]
+            counts = Counter(execution.tools_used)
+            tools_line = ", ".join(
+                f"{name} x{counts[name]}" for name in ("web_search", "fetch_webpage") if counts[name]
+            )
+            print(
+                "\n" + "=" * 40 + f"\n研究摘要 — {task.id}\n" + "=" * 40
+                + f"\n任务类型：{task.task_type}"
+                + f"\n依赖：{', '.join(task.depends_on) or '无'}"
+                + f"\n工具调用：{tools_line or '无'}"
+                + f"\n压缩结果字符数：{len(execution.compact.model_dump_json())}"
+                + "\n" + execution.memo,
+                flush=True,
+            )

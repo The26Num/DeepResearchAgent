@@ -6,6 +6,8 @@ import requests
 from bs4 import BeautifulSoup
 from langchain_core.tools import tool
 
+from app.research.runtime import bounded_request_timeout
+
 
 _USER_AGENT = "Mozilla/5.0 (compatible; DeepResearchAgent/0.1; research tool)"
 DEFAULT_MAX_CHARS = 5000
@@ -22,7 +24,7 @@ def fetch_webpage(url: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     effective_max = min(max_chars, MAX_ALLOWED_CHARS)
 
     try:
-        response = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=15)
+        response = requests.get(url, headers={"User-Agent": _USER_AGENT}, timeout=bounded_request_timeout(15))
         response.raise_for_status()
     except requests.RequestException as exc:
         return json.dumps({"url": url, "error": f"fetch failed: {type(exc).__name__}: {exc}"}, ensure_ascii=False)

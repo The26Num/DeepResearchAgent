@@ -15,4 +15,6 @@ def create_llm() -> ChatOpenAI:
         api_key=settings.siliconflow_api_key,
         base_url=settings.siliconflow_base_url,
         temperature=0,
+        timeout=settings.model_request_timeout_seconds,
+        max_retries=settings.model_max_retries,
     )

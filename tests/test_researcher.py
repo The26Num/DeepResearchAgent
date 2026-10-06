@@ -2,6 +2,7 @@ import json
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import tool
 
 from app.agents.researcher import MAX_RESEARCH_INPUT_CHARS, Researcher
 from app.schemas import CompactResearchResult, ResearchTask, SourceSummary
@@ -17,10 +18,17 @@ def test_researcher_prompt_requires_chinese_and_diverse_broad_queries() -> None:
     assert all(f"## {heading}" in prompt for heading in ("研究任务", "主要发现", "重要来源", "不确定性与缺失信息"))
 
 
+@tool
+def fake_source_fetch(url: str, max_chars: int = 5000) -> str:
+    """Read a fresh source without network access."""
+    return json.dumps({"url": url, "text": "Freshly fetched method details"})
+
+
 def make_researcher(factory) -> Researcher:
     researcher = Researcher.__new__(Researcher)
     researcher.system_prompt = "System instructions"
     researcher._agent_factory = factory
+    researcher._source_fetch_tool = fake_source_fetch
     return researcher
 
 
@@ -105,25 +113,27 @@ def test_researcher_reminds_agent_to_read_search_result() -> None:
     assert len(requests) == 2
 
 
-def test_analysis_with_url_only_compact_context_requires_source_reading() -> None:
+def test_analysis_reads_sources_before_model_even_when_model_skips_tools() -> None:
     requests: list[dict] = []
+    budgets = []
 
     class AgentStub:
         def invoke(self, request: dict) -> dict:
             requests.append(request)
-            if len(requests) == 1:
-                return {"messages": [AIMessage(content="Premature analysis")]}
-            return {"messages": [
-                ToolMessage(content=json.dumps({"url": "https://example.org/paper", "text": "Method details"}), tool_call_id="call1", name="fetch_webpage"),
-                AIMessage(content="Method analysis"),
-            ]}
+            assert budgets[0].fetch_calls == 1
+            return {"messages": [AIMessage(content="Method analysis")]}
 
-    researcher = make_researcher(lambda budget: AgentStub())
+    def factory(budget):
+        budgets.append(budget)
+        return AgentStub()
+    researcher = make_researcher(factory)
     task = ResearchTask(id="task2", title="Methods", question="What methods?", description="Analyze papers", task_type="analysis")
     assert researcher.research(task, {"task1": compact("task1")}).memo == "Method analysis"
-    assert len(requests) == 2
+    assert len(requests) == 1
     assert "fetch_webpage" in requests[0]["messages"][0]["content"]
-    assert "https://example.org/paper" in requests[1]["messages"][-1].content
+    assert "CURRENT TASK SOURCE READINGS" in requests[0]["messages"][0]["content"]
+    assert "Freshly fetched method details" in requests[0]["messages"][0]["content"]
+    assert budgets[0].calls == ["fetch_webpage"]
 
 
 def test_analysis_rereads_even_a_detailed_compact_key_point() -> None:

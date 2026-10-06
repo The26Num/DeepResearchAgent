@@ -12,18 +12,38 @@ from app.schemas.plan import ResearchPlan, validate_plan_dependencies
 
 
 _PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "supervisor.md"
+_DECOMPOSITION_PROMPT = _PROMPT.with_name("decomposition.md")
 
 
 class Supervisor:
     def __init__(self, model: BaseChatModel) -> None:
         self.model = model
         self.system_prompt = _PROMPT.read_text(encoding="utf-8")
+        self.decomposition_prompt = _DECOMPOSITION_PROMPT.read_text(encoding="utf-8")
 
     def create_plan(self, query: str) -> ResearchPlan:
         if not query.strip():
             raise ValueError("Research query must not be empty.")
 
-        dated_query = f"Current date: {date.today().isoformat()}\nResearch question: {query}"
+        dated_query = (
+            f"Current date: {date.today().isoformat()}\nResearch question: {query}\n"
+            "规划要求：先根据这个问题动态选择互补、保留完整主题的独立搜索子问题。"
+            "如果该问题涉及多方面研究进展，必须分别输出多个 discovery，不能仅用一个"
+            "笼统的搜索任务覆盖整个问题；只有无法有意义拆分的窄问题才用单个 discovery。"
+            "每个 discovery 的 depends_on=[]，再由有依赖的 analysis 和 synthesis 汇合结果。"
+        )
+        subproblems = self.model.invoke([
+            SystemMessage(content=self.decomposition_prompt), HumanMessage(content=dated_query),
+        ]).text.strip()
+        if not subproblems:
+            raise ValueError("Supervisor must identify research subproblems before creating a plan.")
+        dated_query += (
+            "\n独立搜索子问题：\n" + subproblems
+            + "\n将上述互补子问题分别设为无依赖的 discovery，再添加分析和最终综合。"
+            "如果子问题重复或偏离原始主题，应合并或修正；不要把独立子问题改成依赖别人的 analysis。"
+            "总任务数必须为 2～6。多个 discovery 通常汇合到一个 analysis，再接一个 synthesis；"
+            "不要机械地为每个 discovery 各添加一个 analysis 或 synthesis，导致超出任务预算。"
+        )
         messages = [SystemMessage(content=self.system_prompt), HumanMessage(content=dated_query)]
         try:
             structured = self.model.with_structured_output(ResearchPlan, method="json_schema")
@@ -55,11 +75,16 @@ class Supervisor:
 
     @staticmethod
     def _validate_plan(plan: ResearchPlan) -> None:
-        if not 3 <= len(plan.tasks) <= 6:
-            raise ValueError("ResearchPlan must contain 3 to 6 tasks.")
+        if not 2 <= len(plan.tasks) <= 6:
+            raise ValueError("ResearchPlan must contain 2 to 6 tasks.")
         for task in plan.tasks:
             if "task_type" not in task.model_fields_set:
                 raise ValueError(f"Supervisor must explicitly set task_type for task {task.id}.")
         validate_plan_dependencies(plan)
+        for task in plan.tasks:
+            if task.task_type == "discovery" and task.depends_on:
+                raise ValueError(f"Discovery task {task.id} must be independent (depends_on=[]).")
+            if task.task_type in ("analysis", "synthesis") and not task.depends_on:
+                raise ValueError(f"{task.task_type.capitalize()} task {task.id} must depend on prior research results.")
         if any(task.status != "pending" for task in plan.tasks):
             raise ValueError("ResearchPlan tasks must start as pending.")
