@@ -17,6 +17,7 @@ from app.research.orchestrator import ResearchOrchestrator
 from app.research.runtime import ResearchModelCallbacks, ResearchRuntime, ResearchTimeoutError, bounded_request_timeout
 from app.research.tool_budget import ToolBudget, budgeted_tools
 from app.schemas import CompactResearchResult, ResearchPlan, ResearchTask, SourceSummary
+from app.schemas.evidence_extraction import ExtractedEvidenceResult
 
 
 researcher_module = importlib.import_module("app.agents.researcher")
@@ -44,6 +45,7 @@ def researcher_with(reader, factory):
     researcher.system_prompt = "System instructions"
     researcher._source_fetch_tool = reader
     researcher._agent_factory = factory
+    researcher._evidence_extractor = SimpleNamespace(extract=lambda payload, runtime: ExtractedEvidenceResult())
     return researcher
 
 
@@ -266,12 +268,16 @@ def test_parallel_timeout_retains_completed_memo_and_stops_pending_tasks(monkeyp
                         stopped.set()
                 return {"messages": [
                     ToolMessage(content='{"results": [{"url": "https://example.org"}]}', name="web_search", tool_call_id="s"),
-                    ToolMessage(content='{"text": "Source text"}', name="fetch_webpage", tool_call_id="f"),
+                    ToolMessage(content='{"url":"https://example.org","title":"Source","text":"Introduction. Completed sibling source fact. Discussion."}', name="fetch_webpage", tool_call_id="f"),
                     AIMessage(content="Completed sibling memo"),
                 ]}
         return Agent()
 
     researcher = researcher_with(None, factory)
+    def extract(payload, runtime):
+        index = next(item["evidence_index"] for item in payload["candidates"] if item["content"] == "Completed sibling source fact.")
+        return ExtractedEvidenceResult(claims=[{"text": "Completed sibling memo", "supporting_evidence_indexes": [index]}])
+    researcher._evidence_extractor = SimpleNamespace(extract=extract)
     try:
         with pytest.raises(RuntimeError, match="D1: ResearchTimeoutError.*Pending tasks not executed: S"):
             ResearchOrchestrator(Supervisor(), researcher).run("Research")
@@ -315,7 +321,9 @@ def test_native_deep_agent_uses_prefetched_evidence_and_model_callbacks(capsys):
         """Read the native agent's evidence offline."""
         return json.dumps({"url": url, "text": "FRESH_NATIVE_SOURCE_EVIDENCE"})
 
-    researcher = Researcher(AnalysisModel())
+    researcher = Researcher(AnalysisModel(), evidence_extractor=SimpleNamespace(
+        extract=lambda payload, runtime: ExtractedEvidenceResult(),
+    ))
     researcher._source_fetch_tool = reader
     result = researcher.research(analysis_task(), context(["https://example.org/a"]))
     assert result.tools_used == ["fetch_webpage"]
@@ -329,6 +337,8 @@ def test_native_deep_agent_uses_prefetched_evidence_and_model_callbacks(capsys):
     ("model_request_timeout_seconds", 0), ("model_max_retries", -1),
     ("research_task_timeout_seconds", -1), ("research_progress_interval_seconds", 0),
     ("research_task_timeout_seconds", float("inf")),
+    ("evidence_extraction_timeout_seconds", 0), ("evidence_extraction_timeout_seconds", float("inf")),
+    ("evidence_extraction_max_tokens", 511), ("evidence_extraction_max_tokens", 8193),
 ])
 def test_invalid_timeout_settings_are_rejected(field, value):
     with pytest.raises(ValueError):

@@ -39,16 +39,15 @@ def test_research_plan_validates_nested_tasks() -> None:
 
 
 def test_source_optional_fields_and_required_url() -> None:
-    source = Source(id="S1", title="A paper", url="https://example.org/paper", source_type="paper")
-    assert source.snippet is None
+    source = Source(source_id="S1", task_id="T1", title="A paper", url="https://example.org/paper", source_type="paper")
     assert source.published_at is None
     with pytest.raises(ValidationError):
-        Source(id="S1", title="A paper", url="", source_type="paper")
+        Source(source_id="S1", task_id="T1", title="A paper", url="", source_type="paper")
 
 
-def test_evidence_confidence_bounds() -> None:
-    evidence = Evidence(id="E1", claim="A claim", source_id="S1", task_id="T1", confidence=0.8)
-    assert evidence.excerpt is None
-    assert evidence.confidence == 0.8
+def test_evidence_represents_a_fragment_without_verification_fields() -> None:
+    evidence = Evidence(evidence_id="E1", content="A source fragment", source_id="S1", task_id="T1")
+    assert evidence.location is None
+    assert evidence.content == "A source fragment"
     with pytest.raises(ValidationError):
-        Evidence(id="E1", claim="A claim", source_id="S1", task_id="T1", confidence=1.1)
+        Evidence(evidence_id="E1", content="A source fragment", source_id="S1", task_id="T1", confidence=0.8)

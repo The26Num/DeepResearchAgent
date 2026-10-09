@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -6,6 +7,7 @@ from langchain_core.tools import tool
 
 from app.agents.researcher import MAX_RESEARCH_INPUT_CHARS, Researcher
 from app.schemas import CompactResearchResult, ResearchTask, SourceSummary
+from app.schemas.evidence_extraction import ExtractedClaim, ExtractedEvidenceResult
 
 
 def test_researcher_prompt_requires_chinese_and_diverse_broad_queries() -> None:
@@ -29,6 +31,7 @@ def make_researcher(factory) -> Researcher:
     researcher.system_prompt = "System instructions"
     researcher._agent_factory = factory
     researcher._source_fetch_tool = fake_source_fetch
+    researcher._evidence_extractor = SimpleNamespace(extract=lambda payload, runtime: ExtractedEvidenceResult())
     return researcher
 
 
@@ -50,7 +53,8 @@ def test_researcher_places_compact_context_before_current_task() -> None:
     researcher = make_researcher(lambda budget: AgentStub())
     task = ResearchTask(id="task2", title="Synthesis", question="What follows?", description="Use previous findings", task_type="synthesis")
     execution = researcher.research(task, {"task1": compact("task1")}, goal="Find latest work")
-    assert execution.memo.startswith("## Key Findings")
+    assert "A synthesis finding." not in execution.memo
+    assert execution.evidence_bundle.claims == []
     assert execution.compact.task_id == "task2"
     message = captured[0]
     assert message.index("RELEVANT PREVIOUS RESEARCH") < message.index("CURRENT TASK") < message.index("PRIMARY OBJECTIVE")
@@ -109,7 +113,8 @@ def test_researcher_reminds_agent_to_read_search_result() -> None:
 
     researcher = make_researcher(lambda budget: AgentStub())
     task = ResearchTask(id="task1", title="Methods", question="Which methods?", description="Research")
-    assert researcher.research(task).memo == "Revised memo"
+    result = researcher.research(task)
+    assert "已读取材料" in result.memo and result.compact.key_findings == []
     assert len(requests) == 2
 
 
@@ -128,7 +133,8 @@ def test_analysis_reads_sources_before_model_even_when_model_skips_tools() -> No
         return AgentStub()
     researcher = make_researcher(factory)
     task = ResearchTask(id="task2", title="Methods", question="What methods?", description="Analyze papers", task_type="analysis")
-    assert researcher.research(task, {"task1": compact("task1")}).memo == "Method analysis"
+    execution = researcher.research(task, {"task1": compact("task1")})
+    assert "Method analysis" not in execution.memo and execution.evidence_bundle.claims == []
     assert len(requests) == 1
     assert "fetch_webpage" in requests[0]["messages"][0]["content"]
     assert "CURRENT TASK SOURCE READINGS" in requests[0]["messages"][0]["content"]
@@ -159,7 +165,8 @@ def test_discovery_uses_prior_url_if_new_search_has_no_results() -> None:
 
     researcher = make_researcher(lambda budget: AgentStub())
     task = ResearchTask(id="task2", title="Benchmarks", question="Which results?", description="Discover")
-    assert researcher.research(task, {"task1": compact("task1")}).memo == "Updated memo"
+    result = researcher.research(task, {"task1": compact("task1")})
+    assert "已读取材料" in result.memo and result.compact.key_findings == []
     assert len(requests) == 2
     assert "https://example.org/paper" in requests[1]["messages"][-1].content
 
@@ -175,7 +182,7 @@ def test_discovery_requires_new_search_even_with_context() -> None:
         researcher.research(task, {"task1": compact("task1")})
 
 
-def test_synthesis_requests_explicit_comparison_when_missing() -> None:
+def test_synthesis_withholds_comparisons_without_formal_evidence() -> None:
     requests: list[dict] = []
 
     class AgentStub:
@@ -188,8 +195,9 @@ def test_synthesis_requests_explicit_comparison_when_missing() -> None:
     researcher = make_researcher(lambda budget: AgentStub())
     task = ResearchTask(id="task3", title="Synthesis", question="What is the trend?", description="Compare", task_type="synthesis")
     execution = researcher.research(task, {"task1": compact("task1"), "task2": compact("task2", "https://example.org/other")})
-    assert "### Differences" in execution.memo
-    assert len(requests) == 2
+    assert "Paper A is useful" not in execution.memo
+    assert execution.compact.key_findings == [] and execution.compact.sources == []
+    assert len(requests) == 1
 
 
 def test_each_task_gets_fresh_agent_and_no_raw_history_crosses_boundary() -> None:
@@ -202,7 +210,7 @@ def test_each_task_gets_fresh_agent_and_no_raw_history_crosses_boundary() -> Non
             if len(agents) == 1:
                 return {"messages": [
                     ToolMessage(content=json.dumps({"results": [{"url": "https://example.org/paper"}]}), tool_call_id="s", name="web_search"),
-                    ToolMessage(content=json.dumps({"url": "https://example.org/paper", "text": "RAW_PAGE_SECRET"}), tool_call_id="f", name="fetch_webpage"),
+                    ToolMessage(content=json.dumps({"url": "https://example.org/paper", "text": "RAW_PAGE_SECRET. A concise finding. More unrelated text."}), tool_call_id="f", name="fetch_webpage"),
                     AIMessage(content="## Key Findings\nA concise finding.\n## Important Sources\n### Paper\n- URL: https://example.org/paper"),
                 ]}
             return {"messages": [
@@ -216,6 +224,12 @@ def test_each_task_gets_fresh_agent_and_no_raw_history_crosses_boundary() -> Non
         return agent
 
     researcher = make_researcher(factory)
+    def extract(payload, runtime):
+        if payload["task"]["task_type"] != "discovery":
+            return ExtractedEvidenceResult()
+        index = next(item["evidence_index"] for item in payload["candidates"] if item["content"] == "A concise finding.")
+        return ExtractedEvidenceResult(claims=[ExtractedClaim(text="A concise finding.", supporting_evidence_indexes=[index])])
+    researcher._evidence_extractor = SimpleNamespace(extract=extract)
     first = researcher.research(ResearchTask(id="task1", title="Papers", question="Which?", description="Find"))
     researcher.research(ResearchTask(id="task2", title="Methods", question="How?", description="Analyze", task_type="analysis"), {"task1": first.compact})
     assert len(agents) == 2 and agents[0] is not agents[1]
@@ -232,14 +246,14 @@ def test_input_safety_preserves_current_task_when_context_is_large() -> None:
     many = {f"task{i}": CompactResearchResult(task_id=f"task{i}", summary="x" * 500, key_findings=["y" * 300] * 6) for i in range(4)}
     request, previous = researcher.build_request(task, many, goal="Research goal")
     assert len(researcher.system_prompt) + len(request) <= MAX_RESEARCH_INPUT_CHARS
-    assert 0 < len(previous) < 8000
+    assert 0 < len(previous) < 16000
     assert "UNTOUCHED_CURRENT_QUESTION" in request
     assert request.index("RELEVANT PREVIOUS RESEARCH") < request.index("CURRENT TASK")
 
 
 def test_input_safety_does_not_silently_drop_all_dependencies() -> None:
     researcher = make_researcher(lambda budget: None)
-    researcher.system_prompt = "S" * 19900
+    researcher.system_prompt = "S" * (MAX_RESEARCH_INPUT_CHARS - 100)
     task = ResearchTask(id="task2", title="Priority", question="What?", description="Analyze", task_type="analysis")
     with pytest.raises(ValueError, match="cannot retain any dependency context"):
         researcher.build_request(task, {"task1": compact("task1")})

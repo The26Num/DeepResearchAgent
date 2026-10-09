@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from threading import Barrier, Event, Lock, get_ident
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -11,6 +12,7 @@ from app.agents.researcher import Researcher
 from app.research.orchestrator import ResearchOrchestrator
 from app.research.tool_budget import budgeted_tools
 from app.schemas import CompactResearchResult, ResearchExecutionResult, ResearchPlan, ResearchTask
+from app.schemas.evidence_extraction import ExtractedEvidenceResult
 
 
 def task(task_id, dependencies=None, task_type="discovery"):
@@ -282,6 +284,7 @@ def test_native_researcher_has_separate_agents_messages_budgets_and_task_logs(ca
     researcher = Researcher.__new__(Researcher)
     researcher.system_prompt = "Research instructions"
     researcher._agent_factory = factory
+    researcher._evidence_extractor = SimpleNamespace(extract=lambda payload, runtime: ExtractedEvidenceResult())
     result = ResearchOrchestrator(SavedSupervisor(plan), researcher).run("Research")
     assert len({id(agent) for agent in agents}) == 3
     assert len({id(budget) for budget in budgets}) == 3

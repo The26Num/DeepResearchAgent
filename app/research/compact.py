@@ -95,6 +95,11 @@ def compact_from_memo(task_id: str, memo: str) -> CompactResearchResult:
         task_id=task_id, summary=summary, key_findings=findings,
         sources=sources, uncertainties=uncertainties,
     )
+    return bound_compact(compact)
+
+
+def bound_compact(compact: CompactResearchResult) -> CompactResearchResult:
+    """Retain the existing public size limit after deterministic rendering."""
     while len(compact.model_dump_json()) > MAX_COMPACT_CHARS:
         if compact.uncertainties:
             compact.uncertainties.pop()

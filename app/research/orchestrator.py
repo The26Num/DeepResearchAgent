@@ -1,11 +1,16 @@
 import asyncio
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.agents.researcher import Researcher
 from app.agents.supervisor import Supervisor
 from app.llm import create_llm
+from app.config import get_settings
 from app.research.context import build_dependency_context
+from app.research.evidence_store import EvidenceStore
+from app.research.evidence_context import EvidenceContext, build_evidence_context
+from app.research.evidence_report import finalize_evidence_report
+from app.schemas.evidence_bundle import TaskEvidenceBundle
 from app.schemas.plan import ResearchPlan, validate_plan_dependencies
 from app.schemas.research_result import CompactResearchResult, ResearchExecutionResult
 from app.schemas.task import ResearchTask
@@ -16,6 +21,8 @@ class ResearchResult:
     plan: ResearchPlan #Supervisor一开始生成的研究计划
     memos: dict[str, str] #给用户看
     compact_results: dict[str, CompactResearchResult]# 给task2看
+    evidence_store: EvidenceStore = field(default_factory=EvidenceStore)
+    evidence_bundles: dict[str, TaskEvidenceBundle] = field(default_factory=dict)
 
 
 class ResearchOrchestrator:
@@ -57,6 +64,7 @@ class ResearchOrchestrator:
             print(f"依赖：{', '.join(task.depends_on) or '无'}\n")
 
         executions: dict[str, ResearchExecutionResult] = {}
+        evidence_store = EvidenceStore()  # One isolated Store per run; workers never receive it.
         while pending_tasks := [task for task in plan.tasks if task.status == "pending"]:
             ready_tasks = self._get_ready_tasks(plan, executions)
             if not ready_tasks:
@@ -73,7 +81,8 @@ class ResearchOrchestrator:
             # Wait for every worker in this batch, including when a sibling fails.
             # Cancelling an await on to_thread() cannot stop its synchronous worker.
             outcomes = await asyncio.gather(
-                *(self._run_task(task, executions, query) for task in batch),
+                *(self._run_task(task, executions, query, evidence_store,
+                                 self._evidence_dependencies(task, plan)) for task in batch),
                 return_exceptions=True,
             )
             failures: list[tuple[ResearchTask, BaseException]] = []
@@ -81,9 +90,44 @@ class ResearchOrchestrator:
                 if isinstance(outcome, BaseException):
                     failures.append((task, outcome))
                 else:
-                    executions[task.id] = outcome
+                    try:
+                        if outcome.evidence_bundle is not None:
+                            if outcome.evidence_bundle.task_id != task.id:
+                                raise ValueError("Returned evidence bundle does not belong to the current task.")
+                            local = outcome.evidence_bundle
+                            before = evidence_store.counts
+                            canonical = evidence_store.merge(local)
+                            after = evidence_store.counts
+                            new_sources = after['sources'] - before['sources']
+                            new_evidence = after['evidence'] - before['evidence']
+                            reused = {key for claim in canonical.claims for key in claim.evidence_ids
+                                      if evidence_store.get_evidence(key).task_id != task.id}
+                            print(f"[{task.id}] store merge: new_sources={new_sources} "
+                                  f"reused_sources={len(local.sources) - new_sources} "
+                                  f"new_evidence={new_evidence} reused_evidence={len(local.evidence) - new_evidence}", flush=True)
+                            print(f"[{task.id}] evidence reuse: reused={len(reused)} new={new_evidence}", flush=True)
+                            outcome = outcome.model_copy(update={"evidence_bundle": canonical}, deep=True)
+                            if isinstance(self.researcher, Researcher) and canonical.claims:
+                                # Re-render after deduplication so displayed metadata
+                                # and reference labels match the Store's canonical graph.
+                                upstream = build_evidence_context(task, evidence_store,
+                                                                  self._evidence_dependencies(task, plan))
+                                sources = {item.source_id: item for item in upstream.sources}
+                                evidence = {item.evidence_id: item for item in upstream.evidence}
+                                sources.update((item.source_id, item) for item in evidence_store.get_sources_for_task(task.id))
+                                evidence.update((item.evidence_id, item) for item in evidence_store.get_evidence_for_task(task.id))
+                                report_context = EvidenceContext(tuple(sources.values()), tuple(evidence.values()), ())
+                                memo, compact = finalize_evidence_report(task, canonical, report_context,
+                                                                         has_reading=bool(local.evidence))
+                                outcome = outcome.model_copy(update={"memo": memo, "compact": compact})
+                        executions[task.id] = outcome
+                    except Exception as error:
+                        task.status = "failed"
+                        print(f"[{task.id}] failed — evidence merge: {type(error).__name__}: {error}", flush=True)
+                        failures.append((task, error))
             if failures:
                 self._print_results(plan, executions)
+                self._print_evidence(plan, evidence_store)
                 detail = "; ".join(
                     f"{task.id}: {type(error).__name__}: {error}" for task, error in failures
                 )
@@ -95,10 +139,14 @@ class ResearchOrchestrator:
                 ) from failures[0][1]
 
         self._print_results(plan, executions)
+        self._print_evidence(plan, evidence_store)
         return ResearchResult(
             plan=plan,
             memos={task.id: executions[task.id].memo for task in plan.tasks},
             compact_results={task.id: executions[task.id].compact for task in plan.tasks},
+            evidence_store=evidence_store,
+            evidence_bundles={task.id: executions[task.id].evidence_bundle for task in plan.tasks
+                              if executions[task.id].evidence_bundle is not None},
         )
 
     @staticmethod
@@ -114,8 +162,21 @@ class ResearchOrchestrator:
             )
         ]
 
+    @staticmethod
+    def _evidence_dependencies(task: ResearchTask, plan: ResearchPlan) -> list[str]:
+        dependencies = list(task.depends_on)
+        if task.task_type == "synthesis":
+            tasks = {item.id: item for item in plan.tasks}
+            for key in dependencies:
+                for parent in tasks[key].depends_on:
+                    if parent not in dependencies:
+                        dependencies.append(parent)
+        return dependencies
+
     async def _run_task(
         self, task: ResearchTask, executions: dict[str, ResearchExecutionResult], query: str,
+        evidence_store: EvidenceStore,
+        evidence_dependencies: list[str] | None = None,
     ) -> ResearchExecutionResult:
         task.status = "running"
         try:
@@ -125,7 +186,19 @@ class ResearchOrchestrator:
                 for dependency in task.depends_on
             }
             if isinstance(self.researcher, Researcher):
-                _, context_text = self.researcher.build_request(task, dependency_context, query)
+                allowed = task.depends_on if evidence_dependencies is None else evidence_dependencies
+                artifacts = build_evidence_context(task, evidence_store, allowed)
+                if task.depends_on:
+                    print(f"[{task.id}] upstream evidence: claims={len(artifacts.claims)} "
+                          f"evidence={len(artifacts.evidence)} sources={len(artifacts.sources)}", flush=True)
+                    available = sum(len(evidence_store.get_claims_for_task(key)) for key in allowed)
+                    represented = {claim.task_id for claim in artifacts.claims}
+                    omitted = [key for key in allowed if key not in represented]
+                    print(f"[{task.id}] upstream coverage: tasks={len(represented)}/{len(allowed)} "
+                          f"claims={len(artifacts.claims)}/{available} omitted_tasks={omitted}", flush=True)
+                _, context_text = self.researcher.build_request(task, dependency_context, query, artifacts)
+                if artifacts.evidence:
+                    context_text += "\n" + artifacts.to_json()
             else:
                 context_text = build_dependency_context(dependency_context)
             print(
@@ -135,9 +208,10 @@ class ResearchOrchestrator:
                 f"[{task.id}] 依赖上下文字符数：{len(context_text)}",
                 flush=True,
             )
-            execution = await asyncio.to_thread(
-                self.researcher.research, task=task, context=dependency_context, goal=query,
-            )
+            arguments = {"task": task, "context": dependency_context, "goal": query}
+            if isinstance(self.researcher, Researcher):
+                arguments["evidence_context"] = artifacts
+            execution = await asyncio.to_thread(self.researcher.research, **arguments)
         except Exception as error:
             task.status = "failed"
             print(f"[{task.id}] failed — {type(error).__name__}: {error}", flush=True)
@@ -145,6 +219,24 @@ class ResearchOrchestrator:
         task.status = "completed"
         print(f"[{task.id}] completed", flush=True)
         return execution
+
+    @staticmethod
+    def _print_evidence(plan: ResearchPlan, store: EvidenceStore) -> None:
+        counts = store.counts
+        reuse = store.reuse_counts
+        print(f"\nEvidence Store: sources={counts['sources']} evidence={counts['evidence']} claims={counts['claims']} "
+              f"source_reuse={reuse['source_reuse']} evidence_reuse={reuse['evidence_reuse']}", flush=True)
+        if get_settings().show_evidence_debug:
+            for task in plan.tasks:
+                for claim in store.get_claims_for_task(task.id):
+                    print(f"[{task.id}] Claim: {claim.text}", flush=True)
+                    print(f"  claim_id: {claim.claim_id}\n  evidence_ids: {claim.evidence_ids}", flush=True)
+                    for item in store.get_evidence_for_claim(claim.claim_id):
+                        source = store.get_source_for_evidence(item.evidence_id)
+                        print(f"  Evidence: {item.content}\n  Source: {source.title} — {source.url}", flush=True)
+                        print(f"  evidence_id: {item.evidence_id} → source_id: {source.source_id}", flush=True)
+                        print(f"  Evidence provenance: {store.get_evidence_provenance(item.evidence_id)}\n"
+                              f"  Source provenance: {store.get_source_provenance(source.source_id)}", flush=True)
 
     @staticmethod
     def _print_results(plan: ResearchPlan, executions: dict[str, ResearchExecutionResult]) -> None:

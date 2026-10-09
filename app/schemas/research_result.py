@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.evidence_bundle import TaskEvidenceBundle
+
 
 class SourceSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -28,3 +30,4 @@ class ResearchExecutionResult(BaseModel):
     memo: str
     compact: CompactResearchResult
     tools_used: list[str]
+    evidence_bundle: TaskEvidenceBundle | None = None
