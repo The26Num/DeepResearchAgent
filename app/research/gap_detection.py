@@ -92,16 +92,23 @@ class GapDetector:
         self.assessor = assessor or RelevanceAssessor()
 
     def detect(self, plan: ResearchPlan, claims: list[Claim], verification_store: VerificationStore,
-               *, research_goal: str | None = None) -> GapDetectionResult:
+               *, research_goal: str | None = None, existing_relevance=None, on_batch_complete=None) -> GapDetectionResult:
         self.assessor.last_usage = RelevanceUsage()
         goal = plan.goal if research_goal is None else research_goal
         claims = validate_relevance_input(goal, plan.tasks, claims)
         latest = {item.claim_id: verification_store.get_latest_verification(item.claim_id) for item in claims}
         # Do not spend a relevance call when support verification is incomplete/stale.
         _check_verifications(claims, {key: value for key, value in latest.items() if value is not None})
-        results = self.assessor.assess_batch(goal, plan.tasks, claims)
-        relevance = {item.claim_id: item for item in results}
-        if len(relevance) != len(results):
+        existing = dict(existing_relevance or {})
+        by_id = {item.claim_id: item for item in claims}
+        if any(key not in by_id or result.claim_id != key or result.task_id != by_id[key].task_id
+               for key, result in existing.items()):
+            raise RelevanceIntegrityError("Restored relevance does not match the current Claims.")
+        missing = [item for item in claims if item.claim_id not in existing]
+        options = {"on_batch_complete": on_batch_complete} if on_batch_complete else {}
+        results = self.assessor.assess_batch(goal, plan.tasks, missing, **options) if missing else []
+        relevance = {**existing, **{item.claim_id: item for item in results}}
+        if len(relevance) != len(existing) + len(results):
             raise RelevanceIntegrityError("Duplicate Claim IDs returned by relevance assessor.")
         gaps = generate_research_gaps(plan.tasks, claims, latest, relevance)
         return GapDetectionResult(gaps, relevance, self.assessor.last_usage)

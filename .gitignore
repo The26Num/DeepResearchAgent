@@ -6,4 +6,7 @@ __pycache__/
 *.egg-info/
 workspace/*
 !workspace/.gitkeep
+*.db
+*.db-wal
+*.db-shm
 

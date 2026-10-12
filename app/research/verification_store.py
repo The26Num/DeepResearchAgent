@@ -35,3 +35,17 @@ class VerificationStore:
         with self._lock:
             latest = {item.claim_id: item for item in self._results.values()}
             return [item.model_copy(deep=True) for item in latest.values()]
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [item.model_dump(mode="json") for item in self._results.values()]
+
+    @classmethod
+    def restore(cls, data: list[dict]) -> "VerificationStore":
+        store = cls()
+        for raw in data:
+            item = VerificationResult.model_validate(raw)
+            if item.verification_id in store._results:
+                raise ValueError("Duplicate Verification ID in checkpoint.")
+            store.add_verification(item)
+        return store

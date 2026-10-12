@@ -31,6 +31,9 @@ from app.research.writing_context import WritingContext, WritingContextBuilder
 from app.research.report_rendering import render_report_with_citations
 from app.research.citations import CitationIntegrityError
 from app.schemas.citation import CitationUsage, RenderedResearchReport
+from app.persistence.models import ResearchRunState, RunStatus
+from app.persistence.manager import CheckpointManager, CheckpointWriteError
+from app.schemas.verification import VerificationResult
 
 
 @dataclass
@@ -53,6 +56,7 @@ class ResearchResult:
     report_grounding: tuple[ReportGroundingAudit, ...] = ()
     rendered_report: RenderedResearchReport | None = None
     citation_usage: CitationUsage = field(default_factory=CitationUsage)
+    run_id: str | None = None
 
 
 class ResearchOrchestrator:
@@ -64,13 +68,10 @@ class ResearchOrchestrator:
         reresearch: bool | None = None, reresearch_planner: ReResearchPlanner | None = None,
         write_report: bool | None = None, writer: ResearchWriter | None = None,
         writing_context_builder: WritingContextBuilder | None = None,
+        run_store=None, failure_injector=None,
     ) -> None:
         if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
             raise ValueError("max_concurrency must be a positive integer.")
-        if supervisor is None or researcher is None:
-            model = create_llm()
-            supervisor = supervisor or Supervisor(model)
-            researcher = researcher or Researcher(model)
         self.supervisor = supervisor
         self.researcher = researcher
         self.max_concurrency = max_concurrency
@@ -89,6 +90,10 @@ class ResearchOrchestrator:
             raise ValueError("Writer requires Claim verification and relevance; enable gap detection or disable write_report.")
         self.writer = writer or ResearchWriter()
         self.writing_context_builder = writing_context_builder or WritingContextBuilder()
+        self.run_store = run_store
+        self.failure_injector = failure_injector
+        self._checkpoint_manager = None
+        self._run_state = None
 
     def run(self, query: str) -> ResearchResult:
         """Synchronous entry point for the CLI; async callers should await arun()."""
@@ -99,10 +104,157 @@ class ResearchOrchestrator:
         raise RuntimeError("An event loop is already running; use await ResearchOrchestrator.arun(query).")
 
     async def arun(self, query: str) -> ResearchResult:
-        plan = await asyncio.to_thread(self.supervisor.create_plan, query)
-        validate_plan_dependencies(plan)  #对研究计划进行依赖性验证，确保没有循环依赖或未定义的依赖
-        if any(task.status != "pending" for task in plan.tasks):  #Supervisor生成的研究计划中的所有任务状态必须是pending，如果不是则抛出异常
-            raise ValueError("ResearchPlan tasks must start as pending.")
+        state = ResearchRunState(goal=query, phase_options={key: getattr(self, key) for key in
+                                ("verify_claims", "detect_gaps", "reresearch", "write_report")},
+                                 citation_debug=get_settings().show_writer_debug)
+        manager = None
+        if self.run_store is not None:
+            run = self.run_store.create_run(query)
+            print("=" * 40 + f"\nRESEARCH RUN\n{'=' * 40}\nRun ID: {run.run_id}\nGoal: {query}", flush=True)
+            manager = CheckpointManager(self.run_store, run.run_id, failure_injector=self.failure_injector)
+        return await self._protected_execute(query, state, manager, new=True)
+
+    def resume(self, run_id: str) -> ResearchResult:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.aresume(run_id))
+        raise RuntimeError("An event loop is already running; use await aresume(run_id).")
+
+    async def aresume(self, run_id: str) -> ResearchResult:
+        if self.run_store is None:
+            from app.persistence.store import ResearchRunStore
+            self.run_store = ResearchRunStore(get_settings().research_db_path)
+        run = self.run_store.get_run(run_id)
+        checkpoint = self.run_store.load_latest_checkpoint(run_id)  # Validate before models or state mutations.
+        state = checkpoint.state
+        if run.status == RunStatus.COMPLETED or "RUN_COMPLETED" in state.completed_stages:
+            if "RUN_COMPLETED" not in state.completed_stages:
+                from app.persistence.serialization import StateIntegrityError
+                raise StateIntegrityError("Completed run has no RUN_COMPLETED checkpoint.")
+            self.run_store.mark_completed(run_id)
+            print(f"Run {run_id} is already completed.", flush=True)
+            if state.rendered_report:
+                print(state.rendered_report.markdown, flush=True)
+            return self._result_from_state(state, run_id)
+        for task in [*(state.research_plan.tasks if state.research_plan else []),
+                     *(task for plan in state.reresearch_summary.plans for task in plan.tasks)]:
+            if task.status in {"running", "failed"}:
+                task.status = "pending"
+        self.run_store.mark_running(run_id)
+        print("=" * 40 + f"\nRESUME RESEARCH RUN\n{'=' * 40}\nRun ID: {run_id}\nGoal: {state.goal}", flush=True)
+        print(f"Latest checkpoint: stage={checkpoint.stage} sequence={checkpoint.sequence}", flush=True)
+        counts = {key: len(getattr(state.evidence_store, key)) for key in ("sources", "evidence", "claims")}
+        completed = [task.id for task in (state.research_plan.tasks if state.research_plan else []) if task.status == "completed"]
+        print(f"Restored: tasks_completed={len(completed)} sources={counts['sources']} evidence={counts['evidence']} "
+              f"claims={counts['claims']} verified_claims={len({item.claim_id for item in state.verification_results})} "
+              f"relevance_claims={len(state.relevance_results)} gaps={len(state.gaps)} "
+              f"reresearch_llm_calls={state.reresearch_budget.get('calls', 0)}", flush=True)
+        print(f"Skipping tasks: {', '.join(completed) or 'none'}", flush=True)
+        print(f"Skipping stages: {', '.join(sorted(state.completed_stages)) or 'none'}", flush=True)
+        stages = ("PLAN_CREATED", "INITIAL_RESEARCH_COMPLETED", "GAP_DETECTION_COMPLETED",
+                  "RERESEARCH_COMPLETED", "WRITER_COMPLETED", "CITATION_COMPLETED", "RUN_COMPLETED")
+        print("Resuming from: " + next((key for key in stages if key not in state.completed_stages), "RUN_COMPLETED"), flush=True)
+        manager = CheckpointManager(self.run_store, run_id, failure_injector=self.failure_injector)
+        manager.safe_state = state.model_copy(deep=True)
+        return await self._protected_execute(state.goal, state, manager)
+
+    async def _protected_execute(self, query, state, manager, *, new=False):
+        self._checkpoint_manager, self._run_state = manager, state
+        try:
+            if manager and new:
+                state.completed_stages.add("RUN_CREATED")
+                manager.save("RUN_CREATED", state)
+            result = await self._execute(query, state)
+            if manager:
+                manager.store.mark_completed(manager.run_id)
+                result.run_id = manager.run_id
+            return result
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            if manager:
+                manager.store.mark_interrupted(manager.run_id)
+            raise
+        except Exception as error:
+            if manager:
+                manager.store.mark_failed(manager.run_id, error)
+            raise
+        finally:
+            if manager:
+                manager.closed = True
+
+    def _enter(self, stage):
+        if self._checkpoint_manager:
+            self._checkpoint_manager.enter(stage)
+
+    def _save(self, stage, *, completed=True):
+        state = self._capture_state()
+        if completed:
+            state.completed_stages.add(stage)
+        if self._checkpoint_manager:
+            self._checkpoint_manager.save(stage, state)
+
+    @staticmethod
+    def _result_from_state(state, run_id=None):
+        store = EvidenceStore.restore(state.evidence_store.model_dump(mode="json"))
+        verified = VerificationStore.restore([item.model_dump(mode="json") for item in state.verification_results])
+        gaps = GapStore()
+        for gap in state.gaps:
+            gaps.add_gap(gap)
+        return ResearchResult(plan=state.research_plan,
+            memos={key: item.memo for key, item in state.task_results.items()},
+            compact_results={key: item.compact for key, item in state.task_results.items()},
+            evidence_store=store, verification_store=verified, gap_store=gaps,
+            evidence_bundles={key: item.evidence_bundle for key, item in
+                              {**state.task_results, **state.supplemental_results}.items() if item.evidence_bundle},
+            verification_usage=state.verification_usage, relevance_results=state.relevance_results,
+            relevance_usage=state.relevance_usage, reresearch_summary=state.reresearch_summary,
+            supplemental_results=state.supplemental_results, report=state.research_report,
+            writer_usage=state.writer_usage, writing_context=state.writing_context,
+            report_grounding=state.report_grounding, rendered_report=state.rendered_report,
+            citation_usage=state.rendered_report.usage if state.rendered_report else CitationUsage(), run_id=run_id)
+
+    def _ensure_research_agents(self):
+        if self.supervisor is None or self.researcher is None:
+            model = create_llm()
+            self.supervisor = self.supervisor or Supervisor(model)
+            self.researcher = self.researcher or Researcher(model)
+
+    async def _execute(self, query, state):
+        for key, value in state.phase_options.items():
+            if key in {"verify_claims", "detect_gaps", "reresearch", "write_report"}:
+                setattr(self, key, value)
+        executions = state.task_results
+        evidence_store = EvidenceStore.restore(state.evidence_store.model_dump(mode="json"))
+        verification_store = VerificationStore.restore([item.model_dump(mode="json") for item in state.verification_results])
+        verification_usage = state.verification_usage
+        relevance_results, relevance_usage = state.relevance_results, state.relevance_usage
+        gap_store = GapStore()
+        for gap in state.gaps:
+            gap_store.add_gap(gap)
+        report, writing_context, writer_usage = state.research_report, state.writing_context, state.writer_usage
+        rendered_report = state.rendered_report
+        plan = state.research_plan
+
+        def capture():
+            state.research_plan, state.task_results = plan, executions
+            from app.persistence.models import EvidenceSnapshot
+            state.evidence_store = EvidenceSnapshot.model_validate(evidence_store.snapshot())
+            state.verification_results = [VerificationResult.model_validate(item) for item in verification_store.snapshot()]
+            state.verification_usage = verification_usage
+            state.relevance_results, state.relevance_usage = relevance_results, relevance_usage
+            state.gaps = gap_store.all_gaps()
+            state.research_report, state.writing_context, state.writer_usage = report, writing_context, writer_usage
+            state.rendered_report = rendered_report
+            return state
+        self._capture_state = capture
+        if plan is None:
+            self._enter("PLANNING")
+            self._ensure_research_agents()
+            plan = await asyncio.to_thread(self.supervisor.create_plan, query)
+            validate_plan_dependencies(plan)
+            if any(task.status != "pending" for task in plan.tasks):
+                raise ValueError("ResearchPlan tasks must start as pending.")
+            self._save("PLAN_CREATED")
         #为什么要求所有任务状态必须是pending？因为在研究计划生成后，所有任务都还没有开始执行。
         #supervisor只负责生成研究计划，而不执行任务。任务的状态在执行过程中会被更新为running、completed或failed。
         #任务状态由ResearchOrchestrator在执行任务时进行管理，以确保任务的执行顺序和依赖关系得到正确处理。
@@ -113,11 +265,8 @@ class ResearchOrchestrator:
             print(f"任务类型：{task.task_type}")
             print(f"依赖：{', '.join(task.depends_on) or '无'}\n")
 
-        executions: dict[str, ResearchExecutionResult] = {}
-        evidence_store = EvidenceStore()  # One isolated Store per run; workers never receive it.
-        verification_store = VerificationStore()
-        verification_usage = VerificationUsage()
         while pending_tasks := [task for task in plan.tasks if task.status == "pending"]:
+            self._ensure_research_agents()
             ready_tasks = self._get_ready_tasks(plan, executions)
             if not ready_tasks:
                 remaining = ", ".join(task.id for task in pending_tasks)
@@ -132,18 +281,31 @@ class ResearchOrchestrator:
             )
             # Wait for every worker in this batch, including when a sibling fails.
             # Cancelling an await on to_thread() cannot stop its synchronous worker.
+            self._enter("INITIAL_RESEARCH_BATCH")
             outcomes = await asyncio.gather(
                 *(self._run_task(task, executions, query, evidence_store,
-                                 self._evidence_dependencies(task, plan)) for task in batch),
+                                 self._evidence_dependencies(task, plan)) if task.id not in executions
+                  else self._saved_execution(executions[task.id]) for task in batch),
                 return_exceptions=True,
             )
+            if self._checkpoint_manager:
+                for task, outcome in zip(batch, outcomes):
+                    if not isinstance(outcome, BaseException):
+                        task.status = "running"  # completed means merge + verification are safe.
             failures: list[tuple[ResearchTask, BaseException]] = []
             for task, outcome in zip(batch, outcomes):
                 if isinstance(outcome, BaseException):
                     failures.append((task, outcome))
                 else:
+                    prior_store = evidence_store
                     try:
+                        if task.id in executions:
+                            continue  # Research/merge were checkpointed; only missing verification remains.
                         if outcome.evidence_bundle is not None:
+                            if self._checkpoint_manager:
+                                # Final memo rendering may fail after merge; don't let
+                                # a sibling checkpoint publish that task's partial work.
+                                evidence_store = EvidenceStore.restore(evidence_store.snapshot())
                             if outcome.evidence_bundle.task_id != task.id:
                                 raise ValueError("Returned evidence bundle does not belong to the current task.")
                             local = outcome.evidence_bundle
@@ -173,7 +335,12 @@ class ResearchOrchestrator:
                                                                          has_reading=bool(local.evidence))
                                 outcome = outcome.model_copy(update={"memo": memo, "compact": compact})
                         executions[task.id] = outcome
+                        if self._checkpoint_manager:
+                            self._save(f"TASK_RESEARCH_COMPLETED:{task.id}", completed=False)
                     except Exception as error:
+                        if isinstance(error, CheckpointWriteError):
+                            raise
+                        evidence_store = prior_store
                         task.status = "failed"
                         print(f"[{task.id}] failed — evidence merge: {type(error).__name__}: {error}", flush=True)
                         failures.append((task, error))
@@ -184,15 +351,26 @@ class ResearchOrchestrator:
                     if task.id not in executions:
                         continue
                     try:
-                        results = await asyncio.to_thread(
-                            self.verifier.verify_batch, evidence_store.get_claims_for_task(task.id), evidence_store)
+                        self._enter(f"TASK_VERIFICATION:{task.id}")
+                        claims = evidence_store.get_claims_for_task(task.id)
+                        missing = [item for item in claims if verification_store.get_latest_verification(item.claim_id) is None]
+                        results = await asyncio.to_thread(self.verifier.verify_batch, missing, evidence_store) if missing or not claims else []
                         for item in results:
                             verification_store.add_verification(item)
                     except Exception as error:
                         print(f"[{task.id}] verification failed — {type(error).__name__}: {error}", flush=True)
                         failures.append((task, error))
                     finally:
-                        verification_usage.add(self.verifier.last_usage)
+                        if missing or not claims:
+                            verification_usage.add(self.verifier.last_usage)
+                    if not any(failed.id == task.id for failed, _ in failures):
+                        task.status = "completed"
+                        self._save(f"TASK_COMPLETED:{task.id}")
+            else:
+                for task in batch:
+                    if task.id in executions and not any(failed.id == task.id for failed, _ in failures):
+                        task.status = "completed"
+                        self._save(f"TASK_COMPLETED:{task.id}")
             if failures:
                 self._print_results(plan, executions)
                 self._print_evidence(plan, evidence_store)
@@ -207,16 +385,28 @@ class ResearchOrchestrator:
                     f"Research tasks failed: {detail}. Pending tasks not executed: {remaining or 'none'}."
                 ) from failures[0][1]
 
-        relevance_results = {}
-        relevance_usage = RelevanceUsage()
-        gap_store = GapStore()
-        if self.detect_gaps:
+        if "INITIAL_RESEARCH_COMPLETED" not in state.completed_stages:
+            self._save("INITIAL_RESEARCH_COMPLETED")
+        if self.detect_gaps and "GAP_DETECTION_COMPLETED" not in state.completed_stages:
+            self._enter("GAP_DETECTION")
             claims = [claim for task in plan.tasks for claim in evidence_store.get_claims_for_task(task.id)]
             try:
-                detection = await asyncio.to_thread(self.gap_detector.detect, plan, claims, verification_store,
-                                                     research_goal=query)
-                relevance_results, relevance_usage, gap_store = (
-                    detection.relevance_results, detection.relevance_usage, detection.gap_store)
+                options = {"research_goal": query}
+                base_usage = RelevanceUsage(**vars(relevance_usage))
+                if self._checkpoint_manager:
+                    def batch_completed(results, usage):
+                        def commit():
+                            nonlocal relevance_usage
+                            relevance_results.update((item.claim_id, item) for item in results)
+                            relevance_usage = RelevanceUsage(**vars(base_usage))
+                            relevance_usage.add(usage)
+                            self._save("RELEVANCE_BATCH_COMPLETED", completed=False)
+                        self._checkpoint_manager.call_on_main(commit)
+                    options.update(existing_relevance=relevance_results, on_batch_complete=batch_completed)
+                detection = await asyncio.to_thread(self.gap_detector.detect, plan, claims, verification_store, **options)
+                relevance_results, gap_store = detection.relevance_results, detection.gap_store
+                relevance_usage = base_usage
+                relevance_usage.add(detection.relevance_usage)
             except Exception as error:
                 self._print_results(plan, executions)
                 self._print_evidence(plan, evidence_store)
@@ -225,13 +415,18 @@ class ResearchOrchestrator:
                 print(f"[Gap Detection] failed — {type(error).__name__}: {error}; "
                       f"relevance_calls={usage.llm_calls} context_chars={usage.context_chars}", flush=True)
                 raise RuntimeError(f"Gap Detection failed: {type(error).__name__}: {error}.") from error
+            self._save("GAP_DETECTION_COMPLETED")
 
-        supplemental = {}
-        rr_summary = ReResearchSummary(initial_gaps=len(gap_store.all_gaps()))
-        if self.reresearch:
+        supplemental = state.supplemental_results
+        rr_summary = state.reresearch_summary
+        if self.reresearch and "RERESEARCH_COMPLETED" not in state.completed_stages:
+            self._enter("RERESEARCH")
             supplemental, rr_summary = await self._run_reresearch(
                 query, plan, evidence_store, verification_store, verification_usage,
                 relevance_results, relevance_usage, gap_store)
+            state.reresearch_summary, state.supplemental_results = rr_summary, supplemental
+            state.reresearch_rounds_completed = rr_summary.rounds
+            self._save("RERESEARCH_COMPLETED")
 
         self._print_results(plan, executions)
         self._print_evidence(plan, evidence_store, [task for item in rr_summary.plans for task in item.tasks])
@@ -240,28 +435,32 @@ class ResearchOrchestrator:
             self._print_gaps(relevance_results, relevance_usage, gap_store)
         if self.reresearch:
             self._print_reresearch(rr_summary, gap_store)
-        report = None
-        writing_context = None
-        writer_usage = WriterUsage()
-        rendered_report = None
-        if self.write_report:
+        if self.write_report and "WRITER_COMPLETED" not in state.completed_stages:
+            self._enter("WRITER")
             try:
                 writing_context = await asyncio.to_thread(self.writing_context_builder.build, query,
                     evidence_store, verification_store, relevance_results, gap_store, plan=plan)
                 report = await asyncio.to_thread(self.writer.write, writing_context)
                 writer_usage = self.writer.last_usage
+                state.report_grounding = self.writer.last_grounding
             except Exception as error:
                 usage = self.writer.last_usage
                 print(f"[Writer] failed — {type(error).__name__}: {error}; calls={usage.llm_calls}", flush=True)
                 raise RuntimeError(f"Writer failed: {type(error).__name__}: {error}.") from error
+            self._save("WRITER_COMPLETED")
+        if self.write_report and "CITATION_COMPLETED" not in state.completed_stages:
+            self._enter("CITATION")
             try:
                 rendered_report = await asyncio.to_thread(render_report_with_citations, report, evidence_store,
-                                                          debug=get_settings().show_writer_debug)
+                                                          debug=state.citation_debug)
             except CitationIntegrityError as error:
                 print(f"[Citation] failed — {error}; llm_calls=0", flush=True)
                 raise RuntimeError(f"Citation failed: {error}") from error
+            self._save("CITATION_COMPLETED")
+        if self.write_report:
             print("\n" + "=" * 40 + "\nFINAL RESEARCH REPORT\n" + "=" * 40, flush=True)
             print(rendered_report.markdown, flush=True)
+        self._save("RUN_COMPLETED")
         return ResearchResult(
             plan=plan,
             memos={task.id: executions[task.id].memo for task in plan.tasks},
@@ -279,25 +478,44 @@ class ResearchOrchestrator:
             report=report,
             writer_usage=writer_usage,
             writing_context=writing_context,
-            report_grounding=self.writer.last_grounding if self.write_report else (),
+            report_grounding=state.report_grounding,
             rendered_report=rendered_report,
             citation_usage=rendered_report.usage if rendered_report else CitationUsage(),
         )
 
+    @staticmethod
+    async def _saved_execution(execution):
+        return execution
+
     async def _run_reresearch(self, query, plan, store, verified, verification_usage,
                             relevance_results, relevance_usage, gaps):
         settings = get_settings()
-        summary = ReResearchSummary(initial_gaps=len(gaps.all_gaps()))
-        supplemental = {}
-        if not settings.max_reresearch_rounds:
+        state = self._run_state
+        summary = state.reresearch_summary
+        supplemental = state.supplemental_results
+        summary.initial_gaps = len(gaps.all_gaps())
+        if not settings.max_reresearch_rounds and not summary.plans:
             return supplemental, summary
-        groups = select_gap_groups(gaps.all_gaps(), settings)
+        groups = state.selected_gap_groups or select_gap_groups(gaps.all_gaps(), settings)
         if not groups:
             summary.stop_reason = "no unresolved gaps"
             return supplemental, summary
         summary.selected_groups = len(groups)
-        budget = ReResearchCallBudget(settings.max_reresearch_llm_calls)
-        before = store.counts
+        state.selected_gap_groups = groups
+        on_reserve = self._checkpoint_manager.reserve_budget if self._checkpoint_manager else None
+        budget = (ReResearchCallBudget.restore(state.reresearch_budget, on_reserve=on_reserve)
+                  if state.reresearch_budget else ReResearchCallBudget(settings.max_reresearch_llm_calls, on_reserve=on_reserve))
+        before = state.reresearch_initial_counts or store.counts
+        state.reresearch_initial_counts = before
+        def checkpoint(stage):
+            state.reresearch_budget = budget.snapshot()
+            summary.llm_calls, summary.calls_by_stage = budget.calls, dict(budget.by_stage)
+            after = store.counts
+            summary.new_sources = after['sources'] - before['sources']
+            summary.new_evidence = after['evidence'] - before['evidence']
+            summary.new_claims = after['claims'] - before['claims']
+            self._save(stage, completed=False)
+        checkpoint("RERESEARCH_STARTED")
         summary.stop_reason = "round limit reached"
         print("\n" + "=" * 40 + "\nRE-RESEARCH ROUND 1\n" + "=" * 40, flush=True)
         print(f"Open gaps: {summary.initial_gaps}; Selected gap groups: {len(groups)}; "
@@ -305,35 +523,48 @@ class ResearchOrchestrator:
         try:
             with use_call_budget(budget):
                 claims = [item for task in plan.tasks for item in store.get_claims_for_task(task.id)]
-                rr_plan = await asyncio.to_thread(self.reresearch_planner.create_plan, query, plan, groups, claims)
+                restored_plan = bool(summary.plans)
+                rr_plan = summary.plans[0] if restored_plan else await asyncio.to_thread(
+                    self.reresearch_planner.create_plan, query, plan, groups, claims)
                 rr_plan = ReResearchPlan.model_validate(rr_plan.model_dump())
                 # Treat even injected/custom planners as untrusted at the scheduling boundary.
                 expected = {group.task_id: set(group.gap_ids) for group in groups}
                 if (len(rr_plan.tasks) != len(groups) or rr_plan.round_id != 1
                         or {task.origin_task_id: set(task.origin_gap_ids) for task in rr_plan.tasks} != expected
-                        or any(task.id in {item.id for item in plan.tasks} or task.status != "pending"
+                        or any(task.id in {item.id for item in plan.tasks} or (not restored_plan and task.status != "pending")
                                for task in rr_plan.tasks)):
                     raise ValueError("Supplemental plan does not match the selected groups or round budget.")
-                summary.plans.append(rr_plan)
+                summary.plans[:] = [rr_plan]
                 summary.rounds = 1
+                checkpoint("RERESEARCH_PLAN_CREATED")
                 for task in rr_plan.tasks:
                     group = next(group for group in groups if group.task_id == task.origin_task_id)
                     print(f"[{task.id}] origin_task={task.origin_task_id} "
                           f"gap_types={','.join(kind.value for kind in group.gap_types)}", flush=True)
                     if settings.show_gap_debug:
                         print(f"  origin_gap_ids={task.origin_gap_ids}", flush=True)
-                new_claims = []
+                new_claims = [claim for task in rr_plan.tasks for claim in store.get_claims_for_task(task.id)]
+                pending = [task for task in rr_plan.tasks if task.id not in supplemental]
+                if pending:
+                    self._ensure_research_agents()
                 # Same bounded gather/to_thread mechanism as the original scheduler.
-                for offset in range(0, len(rr_plan.tasks), self.max_concurrency):
+                for offset in range(0, len(pending), self.max_concurrency):
                     if budget.exhausted:
                         raise ReResearchBudgetExhausted("Re-Research budget exhausted.")
-                    batch = rr_plan.tasks[offset:offset + self.max_concurrency]
-                    summary.tasks += len(batch)
+                    batch = pending[offset:offset + self.max_concurrency]
+                    state.reresearch_started_tasks.update(task.id for task in batch)
+                    summary.tasks = len(state.reresearch_started_tasks)
                     print(f"正在执行补充研究：{len(batch)} 项（并发上限 {self.max_concurrency}）", flush=True)
                     outcomes = await asyncio.gather(
                         *(self._run_task(task, {}, query, store, []) for task in batch), return_exceptions=True)
+                    if self._checkpoint_manager:
+                        for task, outcome in zip(batch, outcomes):
+                            if not isinstance(outcome, BaseException):
+                                task.status = "running"
                     for task, outcome in zip(batch, outcomes):
                         if isinstance(outcome, BaseException):
+                            if isinstance(outcome, CheckpointWriteError):
+                                raise outcome
                             summary.failures[task.id] = f"{type(outcome).__name__}: {outcome}"
                             continue
                         try:
@@ -351,12 +582,19 @@ class ResearchOrchestrator:
                             after = store.counts
                             print(f"[{task.id}] evidence: new_sources={after['sources'] - counts['sources']} "
                                   f"new_evidence={after['evidence'] - counts['evidence']} new_claims={len(added)}", flush=True)
+                            if self._checkpoint_manager:
+                                checkpoint(f"RERESEARCH_TASK_RESEARCH_COMPLETED:{task.id}")
                         except Exception as error:
+                            if isinstance(error, CheckpointWriteError):
+                                raise
                             task.status = "failed"
                             summary.failures[task.id] = f"{type(error).__name__}: {error}"
                 for task in rr_plan.tasks:
-                    batch_claims = [item for item in new_claims if item.task_id == task.id]
+                    all_task_claims = [item for item in new_claims if item.task_id == task.id]
+                    batch_claims = [item for item in all_task_claims if verified.get_latest_verification(item.claim_id) is None]
                     if not batch_claims:
+                        if task.id in supplemental:
+                            task.status = "completed"
                         continue
                     try:
                         decisions = await asyncio.to_thread(self.verifier.verify_batch, batch_claims, store)
@@ -376,12 +614,29 @@ class ResearchOrchestrator:
                         usage = self.verifier.last_usage
                         verification_usage.add(usage)
                         summary.verification_calls += usage.llm_calls
+                    if task.id not in summary.failures:
+                        task.status = "completed"
+                        checkpoint(f"RERESEARCH_TASK_COMPLETED:{task.id}")
                 # Assess only new claims whose verification succeeded; one compact batch pass.
-                eligible = [item for item in new_claims if verified.get_latest_verification(item.claim_id) is not None]
+                eligible = [item for item in new_claims if verified.get_latest_verification(item.claim_id) is not None
+                            and item.claim_id not in relevance_results]
                 if eligible:
                     assessor = self.gap_detector.assessor
                     try:
-                        decisions = await asyncio.to_thread(assessor.assess_batch, query, rr_plan.tasks, eligible)
+                        options = {}
+                        base_usage = RelevanceUsage(**vars(relevance_usage))
+                        prior_calls = summary.relevance_calls
+                        if self._checkpoint_manager:
+                            def batch_completed(results, usage):
+                                def commit():
+                                    relevance_results.update((item.claim_id, item) for item in results)
+                                    for name, value in vars(base_usage).items():
+                                        setattr(relevance_usage, name, value + getattr(usage, name))
+                                    summary.relevance_calls = prior_calls + usage.llm_calls
+                                    checkpoint("RERESEARCH_RELEVANCE_BATCH_COMPLETED")
+                                self._checkpoint_manager.call_on_main(commit)
+                            options["on_batch_complete"] = batch_completed
+                        decisions = await asyncio.to_thread(assessor.assess_batch, query, rr_plan.tasks, eligible, **options)
                         if (len(decisions) != len(eligible)
                                 or {item.claim_id for item in decisions} != {item.claim_id for item in eligible}
                                 or any(item.task_id != next(claim.task_id for claim in eligible if claim.claim_id == item.claim_id)
@@ -390,8 +645,9 @@ class ResearchOrchestrator:
                         relevance_results.update((item.claim_id, item) for item in decisions)
                     finally:
                         usage = assessor.last_usage
-                        relevance_usage.add(usage)
-                        summary.relevance_calls += usage.llm_calls
+                        for name, value in vars(base_usage).items():
+                            setattr(relevance_usage, name, value + getattr(usage, name))
+                        summary.relevance_calls = prior_calls + usage.llm_calls
                 latest = {item.claim_id: item for item in verified.latest_results}
                 for task in rr_plan.tasks:
                     status = update_group_status(gaps, task.origin_gap_ids,
@@ -404,12 +660,15 @@ class ResearchOrchestrator:
         except ReResearchBudgetExhausted:
             summary.stop_reason = "budget exhausted"
         except Exception as error:
+            if isinstance(error, CheckpointWriteError):
+                raise
             summary.stop_reason = "supplemental stage failed"
             summary.failures["stage"] = f"{type(error).__name__}: {error}"
         finally:
             budget.close()
             summary.llm_calls = budget.calls
             summary.calls_by_stage = dict(budget.by_stage)
+            state.reresearch_budget = budget.snapshot()
             after = store.counts
             summary.new_sources = after['sources'] - before['sources']
             summary.new_evidence = after['evidence'] - before['evidence']

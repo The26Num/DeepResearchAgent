@@ -4,7 +4,7 @@
 
 DeepResearch Agent 是一个面向证据驱动研究的命令行项目：将开放式问题规划为研究任务，搜索并读取外部来源，再经过分析与综合输出研究摘要。
 
-当前已完成 **Phase 1 — Research 基础链路**、**Phase 2 — Parallel Research**、**Phase 3 — Evidence System**、**Phase 4 — Verifier Loop** 和 **Phase 5 — Writer + Citation**。系统动态生成研究 DAG，并行研究，验证证据支持与目标相关性，在预算内补研究，最后用合格 Claim 生成结构化报告，再由程序生成编号引用和 References。持久化留待后续阶段。
+当前已完成 **Phase 1 — Research 基础链路**、**Phase 2 — Parallel Research**、**Phase 3 — Evidence System**、**Phase 4 — Verifier Loop**、**Phase 5 — Writer + Citation** 和 **Phase 6 — Persistence / Checkpoint / Resume**。系统动态生成研究 DAG，并行研究，验证证据支持与目标相关性，在预算内补研究，最后用合格 Claim 生成结构化报告，再由程序生成编号引用和 References。CLI 默认把安全边界的 JSON 快照保存到 SQLite，支持按 Run ID 显式恢复。
 
 ## Features / 当前能力
 
@@ -17,6 +17,7 @@ DeepResearch Agent 是一个面向证据驱动研究的命令行项目：将开�
 - 执行可观测性：记录任务 ID、工具与模型请求阶段、结果数量、耗时、等待进度及明确的失败原因。
 - 证据报告：Writer 只读消费 `SUPPORTED + ALIGNED` Claim，发布前批量检查段落和标题是否被所引用的 Claim 支持；不通过时保守回退。正文保留 Claim → Evidence → Source 关联，分别统计写作与语义核验用量。
 - 确定性引用：按最终报告正文首次使用 Source 的顺序分配 `[1][2]`，从 Store 元数据生成去重 References，完整性检查通过后才打印报告；citation 模型调用及输入/输出 tokens 均为 0。
+- 持久化恢复：CLI 为研究生成 Run ID，以 SQLite 保存安全 JSON 快照；可按 ID 恢复并跳过已完成任务/阶段，保留证据 ID、去重状态和补研究预算。
 
 ## Development Phases / 开发阶段
 
@@ -383,15 +384,21 @@ Phase 4B 流程：Research → Verify → Detect Gap；默认 CLI 继续进入�
 
 **Phase 5B 真实验收：** 保持当前 Qwen 2.5 模型，原始 sparse reward offline RL 问题正常退出，accepted=5、used=3、cited_sources=1、citation_markers=4、references=1。另以 `functools.cache` 文档类问题运行真实研究全链路，accepted=11、used=11、cited_sources=1、citation_markers=4、references=1；逐段核对 Claim → 完整 Evidence → Source → marker → Reference，并确认重复渲染完全一致。两次 citation 均为 0 calls / 0 input tokens / 0 output tokens。第二个问题实际引用了第三方 HTML 教程，此验收不表示官方文档覆盖充分；多来源编号由离线测试覆盖。该样例首轮在 Writer 之前遇到既有 Windows GBK 控制台打印 `¶` 的编码错误，随后用 UTF-8 日志捕获重跑通过，没有修改研究流程。原始问题此次没有触发 zero accepted 分支，该分支的零调用、无 References 及正常完成行为由离线 Writer/Citation 和 CLI 集成测试覆盖。
 
-Phase 5 仅输出 Markdown / CLI text；不实现 APA/BibTeX、PDF/DOCX/HTML 导出、checkpoint 或研究状态持久化。引用正确表示映射正确，不等于新增一次事实支持或相关性判断。
+Phase 5 仅输出 Markdown / CLI text；不实现 APA/BibTeX、PDF/DOCX/HTML 导出。Checkpoint 和研究状态持久化由 Phase 6 外层基础设施负责。引用正确表示映射正确，不等于新增一次事实支持或相关性判断。
 
 ### Phase 6 — Persistence
 
-**Status: Planned**
+**Status: Completed**
 
-- **Goal / 目标：** 保存研究状态并支持中断后继续执行。
-- **Planned Scope / 计划范围：** Checkpoint、SQLite、研究项目与结果持久化、Resume Research。
-- **Completion Criteria / 预期验收：** 重启后能够恢复计划、任务状态和已有结果，继续未完成的研究。
+- SQLite-backed Research Runs：CLI 每次新研究生成 UUID `run_id`，默认写入 `workspace/research.db`；仅 `research_runs`、`checkpoints` 两张业务表，标准库 `sqlite3`，无 ORM。支持 `RESEARCH_DB_PATH` 或 `--db-path` 覆盖位置。
+- Safe Checkpoints：计划、任务研究/合并、任务验证、初始研究、relevance 完整批次、Gap Detection、补研究计划/任务/批次与整轮、grounded Writer、Citation 和 Run 完成后落盘。Checkpoint INSERT 与 Run 指针 UPDATE 在同一个事务中提交，失败回滚；保留所有安全快照并输出大小与耗时。
+- Explicit Resume：`--resume RUN_ID` 恢复状态后继续现有 DAG Scheduler，跳过已完成任务、Verification/Relevance、Gap 和阶段。`running/failed` 任务恢复为 `pending`；已保存研究产物的任务只补缺失验证。直接传问题总是创建新 Run，不按 Goal 自动恢复。
+- Snapshot-based Persistence：Pydantic JSON 保存计划、任务产物、EvidenceStore 的 ID/alias/provenance、验证历史、相关性、缺口、补研究计划/轮次/预算、grounded 报告、引用渲染结果和必要 usage。`STATE_VERSION=1`，不使用 pickle，不保存 Agent、模型、锁、连接或网页抓取历史。
+- Budget Recovery：补研究每次模型请求前，由主调度线程持久化调用许可；Worker 不直接写 SQLite。崩溃后的预算不会归零，已落盘但尚未发出请求的许可保守计入预算。已完成补研究任务与整轮不重跑，局部中断任务在剩余额度内恢复。
+- Failure Recovery：普通异常标记 `FAILED`，Ctrl+C 标记 `INTERRUPTED`，保留最后安全快照。恢复前检查版本、引用链、任务结果与完成阶段。`WRITER_COMPLETED` 包含 grounding；已完成 Writer/Citation 不再执行，已完成 Run 直接显示已有报告。
+- No secret persistence：明确列出可存状态，不序列化 Settings/.env/headers；已配置密钥还用于持久化文本与错误信息脱敏。SQLite/WAL/SHM 文件均在 Git ignore 中。
+
+详细表结构、恢复规则、32 项交付说明与验收记录见 [Phase 6 Persistence](docs/phase6-persistence.md)。Phase 7/8 未提前实现。
 
 ### Phase 7 — Evaluation
 
@@ -439,6 +446,7 @@ Phase 5 仅输出 Markdown / CLI text；不实现 APA/BibTeX、PDF/DOCX/HTML 导
 | [report_grounding.py](app/agents/report_grounding.py)、[核验 schema](app/schemas/report_grounding.py)、[核验 prompt](app/prompts/report_grounding.md) | 一次批量核验报告表述与所引 Claim，范围规则兜底、未通过/异常时保守回退，并保留审计与独立用量。 |
 | [citations.py](app/research/citations.py)、[citation.py](app/schemas/citation.py)、[report_rendering.py](app/research/report_rendering.py) | 确定性解析完整 provenance、报告级编号、只读渲染 References 与发布前引用校验，模型调用为 0。 |
 | [config.py](app/config.py)、[llm.py](app/llm.py) | 从环境变量和 `.env` 读取配置，集中创建 OpenAI 兼容模型，支持阿里云百炼 Qwen 与旧版 SiliconFlow 配置。 |
+| [app/persistence](app/persistence) | SQLite Run metadata、版本化 JSON 快照、原子提交、完整性检查与主调度线程 Checkpoint Manager。 |
 | [app/prompts](app/prompts) | 独立保存拆分、计划与 Researcher 指令。 |
 
 ## Installation / 安装
@@ -474,6 +482,7 @@ SHOW_EVIDENCE_DEBUG=false
 
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
+| `RESEARCH_DB_PATH` | CLI 的 SQLite 文件路径，可由 `--db-path` 覆盖。 | `workspace/research.db` |
 | `MODEL_API_KEY` | OpenAI 兼容模型服务密钥，与 `MODEL_BASE_URL` 成对配置，优先于旧版 SiliconFlow 配置。 | 无 |
 | `MODEL_BASE_URL` | 模型服务的 OpenAI 兼容 API 地址；百炼填写控制台提供的工作空间地址。 | 无 |
 | `MODEL_NAME` | 对应服务支持的模型 ID，例如 `qwen3.7-flash`；运行研究时必填，模型需支持工具调用。 | 无 |
@@ -578,20 +587,26 @@ result = orchestrator.run("调研 sparse reward offline reinforcement learning �
 
 ```powershell
 python main.py "调研 sparse reward offline reinforcement learning 的最新研究进展"
+python main.py --resume RUN_ID
+python main.py --list-runs
+# 可选覆盖数据库路径
+python main.py --resume RUN_ID --db-path workspace/research.db
 ```
 
-也可直接运行 `python main.py`，按提示输入问题。终端会显示研究计划、执行批次、任务类型、依赖、依赖上下文字符数、工具与模型阶段、耗时、调用统计、压缩结果字符数和各任务 Memo。
+也可直接运行 `python main.py`，按提示输入问题。启动显示 Run ID；终端会显示研究计划、执行批次、任务类型、依赖、依赖上下文字符数、工具与模型阶段、耗时、调用统计、压缩结果字符数和各任务 Memo。恢复时显示最新 Checkpoint、恢复的数据量、跳过任务/阶段与下一阶段。问题、`--resume`、`--list-runs` 互斥。
 
 异步应用使用 `arun()`：
 
 ```python
 from app.research.orchestrator import ResearchOrchestrator
+from app.persistence.store import ResearchRunStore
 
 async def research(query: str):
-    return await ResearchOrchestrator(max_concurrency=3).arun(query)
+    return await ResearchOrchestrator(max_concurrency=3,
+        run_store=ResearchRunStore("workspace/research.db")).arun(query)
 ```
 
-已经运行事件循环的应用应调用 `arun()`，同步 `run()` 会对此明确报错。成功时 ResearchResult 提供 `plan/memos/compact_results/evidence_bundles/evidence_store`，以及 `verification_store/verification_usage/relevance_results/relevance_usage/gap_store/supplemental_results/reresearch_summary/report/writer_usage/writing_context/report_grounding/rendered_report/citation_usage`。原始文本在 `result.report`；带引用 Markdown 在 `result.rendered_report.markdown`，书目在 `.references`，逐段关联在 `.citations`。CLI 显示带引用视图，当前没有自动持久化功能。独立验证旧阶段可使用 `ResearchOrchestrator(..., reresearch=False, write_report=False)`，此时 Writer/Citation 均不执行。关闭 verification/relevance 时默认关闭 Writer，不能显式启用依赖缺失的 Writer。
+已经运行事件循环的应用应调用 `arun()` / `aresume(run_id)`，同步 `run()` / `resume(run_id)` 会对此明确报错。成功时 ResearchResult 提供 `run_id/plan/memos/compact_results/evidence_bundles/evidence_store`，以及 `verification_store/verification_usage/relevance_results/relevance_usage/gap_store/supplemental_results/reresearch_summary/report/writer_usage/writing_context/report_grounding/rendered_report/citation_usage`。原始文本在 `result.report`；带引用 Markdown 在 `result.rendered_report.markdown`，书目在 `.references`，逐段关联在 `.citations`。CLI 默认持久化；嵌入式 API 显式传 `run_store` 启用，省略时保留纯内存行为。恢复会重读 `.env` 并创建所需运行时对象，已完成 Run 不需要模型调用。独立验证旧阶段可使用 `ResearchOrchestrator(..., reresearch=False, write_report=False)`，此时 Writer/Citation 均不执行。关闭 verification/relevance 时默认关闭 Writer，不能显式启用依赖缺失的 Writer。
 
 ## Testing / 工程验证
 
@@ -601,7 +616,7 @@ async def research(query: str):
 python -m pytest -q
 ```
 
-当前全部 625 项离线测试通过。测试涵盖计划与依赖校验、上下文压缩、来源去重、工具返回格式和预算，以及并行调度、并发限制、状态隔离、来源预读和超时处理。Phase 3 覆盖证据抽取、完整引用、去重/provenance/回滚和跨任务复用；Phase 4 覆盖批量验证、相关性、缺口、预算补研究及 4B 当前批次的一次超时重试；Phase 5A 的 55 项 Writer 用例及 34 项报告核验用例覆盖只读写作、完整追溯、语义发布门、保守回退、最终覆盖率、用量预算与错误隔离。Phase 5B 的 40 项用例覆盖确定性引用、首次出现编号、完整链路、去重、零 Claim、渲染校验与零模型调用。真实研究运行另外需要可用的模型服务、Tavily API Key，以及可访问目标网页的网络。
+当前全部 667 项离线测试通过。测试涵盖计划与依赖校验、上下文压缩、来源去重、工具返回格式和预算，以及并行调度、并发限制、状态隔离、来源预读和超时处理。Phase 3 覆盖证据抽取、完整引用、去重/provenance/回滚和跨任务复用；Phase 4 覆盖批量验证、相关性、缺口、预算补研究及 4B 当前批次的一次超时重试；Phase 5A 的 55 项 Writer 用例及 34 项报告核验用例覆盖只读写作、完整追溯、语义发布门、保守回退、最终覆盖率、用量预算与错误隔离。Phase 5B 的 40 项用例覆盖确定性引用、首次出现编号、完整链路、去重、零 Claim、渲染校验与零模型调用。Phase 6 新增 42 项用例，覆盖真实 SQLite 事务回滚、任务/阶段跳过、重复恢复、完整性和版本拒绝、补研究轮次/预算许可、主线程写入、运行时重建、零合格报告、CLI 和密钥排除。真实研究运行另外需要可用的模型服务、Tavily API Key，以及可访问目标网页的网络。
 
 ## Current Limitations / 当前限制
 
@@ -613,7 +628,7 @@ python -m pytest -q
 - 任务超时限制调用方等待并阻止后续步骤，不能强行取消正在运行的同步 HTTP 请求；底层请求与框架线程仍需按自身超时收尾。
 - Evidence/Claim 抽取依赖模型；越界候选引用按整条 Claim 舍弃，其他格式错误、原文不匹配、恢复后仍截断或请求超时会明确失败。空的抽取结果不产生正式 Claim，成功的结构化关系也不表示已经完成事实验证。
 - Writer 严格消费上游 `SUPPORTED + ALIGNED` 判断，并增加报告表述的语义核验与规则兜底；核验失败时回退原 Claim，但上游误判和语义核验模型误判仍可能影响报告。规则较保守，回退可能降低语言流畅度。生成超限、结构错误或无效关联时不发布不完整报告，失败不触发新研究。
-- 已有结构化 Writer、确定性 citation 与 References，但不实现专业 citation style 或文档导出。结果及 EvidenceStore 保存在内存中，尚无 checkpoint、SQLite 持久化或恢复执行。
+- 已有结构化 Writer、确定性 citation 与 References，不实现专业 citation style 或文档导出。CLI 支持 SQLite 安全快照恢复；不能续接执行到一半的 HTTP/LLM 请求，也不支持多个进程同时恢复同一个 Run。并行批次内尚未返回主调度器的结果不构成安全 Checkpoint。
 
 ## Roadmap
 
@@ -624,7 +639,7 @@ python -m pytest -q
 | Phase 3 — Evidence System | Completed | Phase 3A 数据模型与内存 Store；3B 结构化抽取；3C 跨任务去重、复用、provenance 与完整链路查询。 |
 | Phase 4 — Verifier Loop | Completed | 4A 批量证据支持验证、4B Gap Detection and Research Relevance、4C 预算内单轮补研究闭环。 |
 | Phase 5 — Writer + Citation | Completed | 5A Evidence-Grounded Writer 与发布前 grounding；5B 确定性引用、References、完整性校验及零模型调用。 |
-| Phase 6 — Persistence | Planned | Checkpoint、SQLite、项目持久化与 Resume Research。 |
+| Phase 6 — Persistence | Completed | SQLite JSON 快照、安全 Checkpoint、显式 Resume、阶段跳过、预算恢复与密钥排除。 |
 | Phase 7 — Evaluation | Planned | Benchmark、Quantitative Evaluation 与可重复的研究质量评测。 |
 | Phase 8 — UI + Docker + README | Planned | UI、Docker、Final Demo、Deployment、Project Packaging 与最终文档整理。 |
 
@@ -639,6 +654,11 @@ deepagent/
 ├── app/
 │   ├── config.py                # Settings
 │   ├── llm.py                   # 模型创建
+│   ├── persistence/
+│   │   ├── models.py            # ResearchRun / ResearchRunState / Checkpoint
+│   │   ├── store.py             # SQLite metadata、原子快照与查询
+│   │   ├── serialization.py     # JSON 版本与状态完整性检查
+│   │   └── manager.py           # 主调度线程安全边界与请求许可
 │   ├── agents/
 │   │   ├── supervisor.py        # 动态规划
 │   │   ├── researcher.py        # 独立任务研究与来源准备

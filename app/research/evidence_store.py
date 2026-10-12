@@ -238,3 +238,76 @@ class EvidenceStore:
         with self._lock:
             key = self.get_source(source_id).source_id
             return [self.get_evidence(evidence_id) for evidence_id in self._source_evidence.get(key, ())]
+
+    def snapshot(self) -> dict:
+        """JSON data only; preserve aliases and provenance as well as canonical IDs."""
+        with self._lock:
+            return {
+                "sources": [item.model_dump(mode="json") for item in self._sources.values()],
+                "evidence": [item.model_dump(mode="json") for item in self._evidence.values()],
+                "claims": [item.model_dump(mode="json") for item in self._claims.values()],
+                "source_aliases": dict(self._source_aliases),
+                "evidence_aliases": dict(self._evidence_aliases),
+                "evidence_alias_origins": {key: list(value) for key, value in self._evidence_alias_origins.items()},
+                "source_users": {key: list(value) for key, value in self._source_users.items()},
+                "evidence_users": {key: list(value) for key, value in self._evidence_users.items()},
+            }
+
+    @classmethod
+    def restore(cls, data: dict) -> "EvidenceStore":
+        """Rebuild indexes without merging or generating any new artifact IDs."""
+        store = cls()
+        for field, model in (("sources", Source), ("evidence", Evidence), ("claims", Claim)):
+            target = getattr(store, "_" + field)
+            id_field = {"sources": "source_id", "evidence": "evidence_id", "claims": "claim_id"}[field]
+            for raw in data[field]:
+                item = model.model_validate(raw)
+                key = getattr(item, id_field)
+                if key in target:
+                    raise ValueError(f"Duplicate {id_field}: {key}.")
+                target[key] = item
+        store._source_aliases = dict(data["source_aliases"])
+        store._evidence_aliases = dict(data["evidence_aliases"])
+        store._evidence_alias_origins = {key: tuple(value) for key, value in data["evidence_alias_origins"].items()}
+        store._source_users = {key: tuple(value) for key, value in data["source_users"].items()}
+        store._evidence_users = {key: tuple(value) for key, value in data["evidence_users"].items()}
+        for aliases, records in ((store._source_aliases, store._sources), (store._evidence_aliases, store._evidence)):
+            if any(value not in records or (key in records and key != value) for key, value in aliases.items()):
+                raise ValueError("Invalid canonical alias in EvidenceStore snapshot.")
+            if any(aliases.get(key) != key for key in records):
+                raise ValueError("Missing canonical identity alias.")
+        if set(store._evidence_alias_origins) != set(store._evidence_aliases):
+            raise ValueError("Missing Evidence alias origins.")
+        if any(len(value) != 2 or not isinstance(value[0], str) or not value[0]
+               or (value[1] is not None and not isinstance(value[1], str)) for value in store._evidence_alias_origins.values()):
+            raise ValueError("Invalid Evidence alias origin.")
+        if any(store._evidence_alias_origins[key] != (item.task_id, item.location) for key, item in store._evidence.items()):
+            raise ValueError("Canonical Evidence origin does not match its metadata.")
+        for records, users in ((store._sources, store._source_users), (store._evidence, store._evidence_users)):
+            if set(records) != set(users) or any(not value or len(value) != len(set(value)) for value in users.values()):
+                raise ValueError("Invalid artifact provenance.")
+            if any(item.task_id not in users[key] for key, item in records.items()):
+                raise ValueError("Artifact origin is missing from provenance.")
+        for item in store._sources.values():
+            key = normalize_source_url(item.url)
+            if key in store._source_urls:
+                raise ValueError("Duplicate canonical source URL.")
+            store._source_urls[key] = item.source_id
+        for item in store._evidence.values():
+            if item.source_id not in store._sources:
+                raise ValueError(f"Evidence {item.evidence_id} references missing Source.")
+            if set(store._evidence_users[item.evidence_id]) - set(store._source_users[item.source_id]):
+                raise ValueError("Evidence use is missing from Source provenance.")
+            key = store._key(item)
+            if key in store._evidence_keys:
+                raise ValueError("Duplicate canonical Evidence fragment.")
+            store._evidence_keys[key] = item.evidence_id
+            store._append(store._source_evidence, item.source_id, item.evidence_id)
+        for item in store._claims.values():
+            for key in item.evidence_ids:
+                if key not in store._evidence:
+                    raise ValueError(f"Claim {item.claim_id} references missing Evidence: {key}.")
+                if item.task_id not in store._evidence_users[key]:
+                    raise ValueError("Claim use is missing from Evidence provenance.")
+                store._append(store._evidence_claims, key, item.claim_id)
+        return store

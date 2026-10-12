@@ -49,7 +49,7 @@ class RelevanceAssessor:
         self.last_usage = RelevanceUsage()
         self._native_available = True
 
-    def assess_batch(self, goal: str, tasks: list[ResearchTask], claims: list[Claim]) -> list[ClaimRelevanceResult]:
+    def assess_batch(self, goal: str, tasks: list[ResearchTask], claims: list[Claim], *, on_batch_complete=None) -> list[ClaimRelevanceResult]:
         self.last_usage = RelevanceUsage()
         contexts = split_relevance_batches(
             goal, tasks, claims, max_claims=self.settings.max_relevance_claims_per_batch,
@@ -63,12 +63,15 @@ class RelevanceAssessor:
         def work():
             results = []
             for index, context in enumerate(contexts, start=1):
+                start = len(results)
                 with runtime.operation(f"claim relevance batch {index}/{len(contexts)}"):
                     decisions = self._assess(context, runtime, index, len(contexts))
                     for claim in context.claims:
                         decision = decisions[claim.claim_id]
                         results.append(ClaimRelevanceResult(claim_id=claim.claim_id, task_id=claim.task_id,
                                                            status=decision.status, reason=decision.reason))
+                if on_batch_complete:
+                    on_batch_complete(results[start:], RelevanceUsage(**vars(self.last_usage)))
             return results
 
         results = runtime.run(work)
