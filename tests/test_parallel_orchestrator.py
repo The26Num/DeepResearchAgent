@@ -48,7 +48,7 @@ def test_three_independent_tasks_really_overlap(capsys):
             barrier.wait()  # A serial implementation cannot pass this barrier.
             return execution(task.id)
 
-    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub()).run("Research")
+    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False).run("Research")
     assert len(worker_threads) == 3
     assert all(item.status == "completed" for item in result.plan.tasks)
     assert "正在执行批次：3 项任务（并发上限 3）" in capsys.readouterr().out
@@ -78,7 +78,7 @@ def test_five_ready_tasks_use_batches_of_three_and_two(capsys):
                     active -= 1
                     finished.add(task.id)
 
-    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), max_concurrency=3).run("Research")
+    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), max_concurrency=3, reresearch=False, write_report=False).run("Research")
     assert peak == 3 and active == 0
     assert list(result.memos) == [f"D{i}" for i in range(1, 6)]
     output = capsys.readouterr().out
@@ -117,7 +117,7 @@ def test_dependencies_wait_for_every_result_and_final_order_is_stable(capsys):
                 finish_order.append(task.id)
             return execution(task.id)
 
-    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub()).run("Research")
+    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False).run("Research")
     assert finish_order == ["D2", "D3", "D1", "A", "S"]
     assert list(result.memos) == ["S", "A", "D1", "D2", "D3"]
     assert list(result.compact_results) == list(result.memos)
@@ -148,7 +148,7 @@ def test_failure_waits_for_batch_and_stops_downstream(capsys):
             return execution(task.id)
 
     with pytest.raises(RuntimeError, match="D2: ValueError: simulated source failure"):
-        ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub()).run("Research")
+        ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False).run("Research")
     assert [item.status for item in plan.tasks] == ["completed", "failed", "completed", "pending", "pending", "pending"]
     assert finished == {"D1", "D3"}
     output = capsys.readouterr().out
@@ -173,7 +173,7 @@ def test_shared_dependencies_are_copied_for_each_execution():
                 assert context["D"].key_findings == [task.id]
             return execution(task.id)
 
-    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub()).run("Research")
+    result = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False).run("Research")
     assert result.compact_results["D"].summary == "Result D"
     assert result.compact_results["D"].key_findings == []
 
@@ -181,7 +181,7 @@ def test_shared_dependencies_are_copied_for_each_execution():
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5, "3"])
 def test_invalid_concurrency_is_rejected(limit):
     with pytest.raises(ValueError, match="positive integer"):
-        ResearchOrchestrator(max_concurrency=limit)
+        ResearchOrchestrator(max_concurrency=limit, reresearch=False, write_report=False)
 
 
 def test_ready_selection_requires_completed_status_and_saved_result():
@@ -203,7 +203,7 @@ def test_async_entry_point_and_sync_entry_point_guard():
         def research(self, task, context, goal):
             return execution(task.id)
 
-    orchestrator = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub())
+    orchestrator = ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False)
 
     async def run():
         with pytest.raises(RuntimeError, match="await ResearchOrchestrator.arun"):
@@ -220,7 +220,7 @@ def test_invalid_dag_is_rejected_before_execution():
 
     plan = ResearchPlan(goal="Research", tasks=[task("D1", ["D2"]), task("D2", ["D1"])])
     with pytest.raises(ValueError, match="cycle"):
-        ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub()).run("Research")
+        ResearchOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False).run("Research")
 
 
 def test_no_ready_tasks_terminates_instead_of_looping():
@@ -239,7 +239,7 @@ def test_no_ready_tasks_terminates_instead_of_looping():
             return ResearchOrchestrator._get_ready_tasks(plan, executions)
 
     with pytest.raises(RuntimeError, match="No research task is ready; unresolved dependencies"):
-        StalledOrchestrator(SavedSupervisor(plan), ResearcherStub()).run("Research")
+        StalledOrchestrator(SavedSupervisor(plan), ResearcherStub(), reresearch=False, write_report=False).run("Research")
 
 
 def test_native_researcher_has_separate_agents_messages_budgets_and_task_logs(capsys):
@@ -285,7 +285,7 @@ def test_native_researcher_has_separate_agents_messages_budgets_and_task_logs(ca
     researcher.system_prompt = "Research instructions"
     researcher._agent_factory = factory
     researcher._evidence_extractor = SimpleNamespace(extract=lambda payload, runtime: ExtractedEvidenceResult())
-    result = ResearchOrchestrator(SavedSupervisor(plan), researcher).run("Research")
+    result = ResearchOrchestrator(SavedSupervisor(plan), researcher, reresearch=False, write_report=False).run("Research")
     assert len({id(agent) for agent in agents}) == 3
     assert len({id(budget) for budget in budgets}) == 3
     assert len({id(request["messages"]) for request in requests}) == 3

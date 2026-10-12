@@ -280,7 +280,7 @@ def test_parallel_timeout_retains_completed_memo_and_stops_pending_tasks(monkeyp
     researcher._evidence_extractor = SimpleNamespace(extract=extract)
     try:
         with pytest.raises(RuntimeError, match="D1: ResearchTimeoutError.*Pending tasks not executed: S"):
-            ResearchOrchestrator(Supervisor(), researcher).run("Research")
+            ResearchOrchestrator(Supervisor(), researcher, reresearch=False, write_report=False).run("Research")
         assert [task.status for task in plan.tasks] == ["failed", "completed", "pending"]
         output = capsys.readouterr().out
         assert "Completed sibling memo" in output

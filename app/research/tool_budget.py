@@ -9,6 +9,8 @@ from threading import Lock
 from langchain_core.tools import BaseTool, tool
 
 from app.schemas.task import ResearchTask
+from app.schemas.reresearch import ReResearchTask
+from app.config import get_settings
 from app.schemas.source import normalize_source_url
 from app.research.runtime import ResearchRuntime
 from app.tools.fetch_webpage import fetch_webpage
@@ -74,6 +76,9 @@ class ToolBudget:
 
     @classmethod
     def for_task(cls, task: ResearchTask) -> "ToolBudget":
+        if isinstance(task, ReResearchTask):
+            settings = get_settings()
+            return cls(settings.reresearch_max_search_calls, settings.reresearch_max_fetch_calls)
         return cls(*_LIMITS[task.task_type])
 
 

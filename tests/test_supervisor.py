@@ -219,7 +219,7 @@ def test_decomposed_plan_runs_serially_with_only_dependency_context(capsys) -> N
                 tools_used=[],
             )
 
-    result = ResearchOrchestrator(SupervisorStub(), ResearcherStub(), max_concurrency=1).run("Research")
+    result = ResearchOrchestrator(SupervisorStub(), ResearcherStub(), max_concurrency=1, reresearch=False, write_report=False).run("Research")
     assert seen == [("D1", []), ("D2", []), ("D3", []), ("A", ["D1", "D2", "D3"]), ("S", ["A"])]
     assert all(task.status == "completed" for task in result.plan.tasks)
     output = capsys.readouterr().out

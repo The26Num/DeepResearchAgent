@@ -243,6 +243,6 @@ def test_failed_discovery_gap_reaches_synthesis_without_invented_upstream_conten
                 return {"messages": [AIMessage(content="## 研究任务\nS\n## 主要发现\n无法确认本分支结论。\n## 重要来源\n暂无\n## 不确定性与缺失信息\n缺少已读取的来源。") ]}
         return Agent()
     researcher._agent_factory = factory
-    result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher).run("Research")
+    result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher, reresearch=False, write_report=False).run("Research")
     assert captured and all(item.status == "completed" for item in result.plan.tasks)
     assert result.evidence_store.counts == {"sources": 0, "evidence": 0, "claims": 0}

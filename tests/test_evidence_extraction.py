@@ -299,7 +299,7 @@ def offline_run(shared_url=False, recover_and_limit=False, output_errors=False):
 
     researcher = Researcher(Model(), factory)
     researcher._source_fetch_tool = fetch
-    result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher).run("Research")
+    result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher, verify_claims=False, reresearch=False, write_report=False).run("Research")
     if output_errors:
         assert attempts == {"D1": 2, "D2": 1, "A": 1, "S": 1}
     return result, requests, budgets
@@ -449,6 +449,6 @@ def test_merge_failure_stops_downstream_without_partial_publication(capsys):
             return ResearchExecutionResult(memo="Memo", compact=CompactResearchResult(task_id="D1", summary="Result"), tools_used=[],
                 evidence_bundle=TaskEvidenceBundle(task_id="D1", evidence=[Evidence(task_id="D1", source_id="src_missing", content="A source fact.")]))
     with pytest.raises(RuntimeError, match="unknown source_id.*Pending tasks not executed: S"):
-        ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), Worker()).run("Research")
+        ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), Worker(), reresearch=False, write_report=False).run("Research")
     assert [item.status for item in plan.tasks] == ["failed", "pending"]
     assert "Evidence Store: sources=0 evidence=0 claims=0" in capsys.readouterr().out

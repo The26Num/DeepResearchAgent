@@ -7,6 +7,7 @@ from time import monotonic
 from typing import Callable, TypeVar
 
 from langchain_core.callbacks import BaseCallbackHandler
+from app.research.reresearch_budget import active_call_budget, use_call_budget
 
 
 _ACTIVE_RUNTIME: ContextVar["ResearchRuntime | None"] = ContextVar("research_runtime", default=None)
@@ -26,6 +27,7 @@ class ResearchRuntime:
         self.closed = Event()
         self._lock = Lock()
         self._stages: dict[object, str] = {}
+        self.call_budget = active_call_budget()
 
     def _timeout_error(self) -> ResearchTimeoutError:
         with self._lock:
@@ -50,7 +52,8 @@ class ResearchRuntime:
     def activate(self):
         token = _ACTIVE_RUNTIME.set(self)
         try:
-            yield
+            with use_call_budget(self.call_budget):
+                yield
         finally:
             _ACTIVE_RUNTIME.reset(token)
 
@@ -139,12 +142,16 @@ class ResearchModelCallbacks(BaseCallbackHandler):
     raise_error = True
     run_inline = True
 
-    def __init__(self, runtime: ResearchRuntime) -> None:
+    def __init__(self, runtime: ResearchRuntime, stage: str = "researcher") -> None:
         self.runtime = runtime
+        self.stage = stage
         self._requests: dict[object, tuple[object, float]] = {}
         self._lock = Lock()
 
     def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs) -> None:
+        self.runtime.remaining()
+        if self.runtime.call_budget is not None:
+            self.runtime.call_budget.reserve(self.stage)
         stage = self.runtime.start_stage("model request")
         with self._lock:
             self._requests[run_id] = stage

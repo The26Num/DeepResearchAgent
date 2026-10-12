@@ -200,6 +200,11 @@ class EvidenceStore:
         with self._lock:
             return [item.model_copy(deep=True) for item in self._claims.values() if item.task_id == task_id]
 
+    def all_claims(self) -> list[Claim]:
+        """Read-only snapshots of initial and supplemental conclusions alike."""
+        with self._lock:
+            return [item.model_copy(deep=True) for item in self._claims.values()]
+
     def get_evidence_for_task(self, task_id: str) -> list[Evidence]:
         """Evidence extracted or used by this task, including cross-task references."""
         with self._lock:

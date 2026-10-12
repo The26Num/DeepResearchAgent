@@ -83,7 +83,7 @@ def test_orchestrator_rerenders_metadata_after_cross_task_canonical_merge():
             return ExtractedEvidenceResult(claims=[{"text": "Supported result", "supporting_evidence_indexes": [0]}])
 
     researcher = Researcher(SimpleNamespace(), lambda budget: Agent(), evidence_extractor=Extractor())
-    result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher).run("Research")
+    result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher, verify_claims=False, reresearch=False, write_report=False).run("Research")
     assert result.evidence_store.counts == {"sources": 1, "evidence": 1, "claims": 2}
     assert "Original D1" in result.memos["D2"] and "Original D2" not in result.memos["D2"]
     assert result.compact_results["D2"].sources[0].title == "Original D1"

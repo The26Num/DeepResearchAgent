@@ -151,7 +151,7 @@ class EvidenceExtractor:
             runtime.log("evidence extraction skipped: no source fragment candidates")
             return ExtractedEvidenceResult()
         data_message = HumanMessage(content=json.dumps(model_payload(payload), ensure_ascii=False, separators=(",", ":")))
-        config = {"callbacks": [ResearchModelCallbacks(runtime)]}
+        config = {"callbacks": [ResearchModelCallbacks(runtime, stage="extraction")]}
         settings = get_settings()
 
         def invoke(model, request, max_tokens):

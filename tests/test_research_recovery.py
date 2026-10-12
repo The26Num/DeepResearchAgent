@@ -7,6 +7,7 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from app.agents.researcher import Researcher, MAX_RESEARCH_INPUT_CHARS
+from app.config import get_settings
 from app.research.evidence_context import EvidenceContext
 from app.research.evidence_extraction import prepare_extraction_payload, build_evidence_bundle
 from app.research.evidence_store import EvidenceStore
@@ -62,7 +63,10 @@ def researcher_with(last, response=None):
     AIMessage(content="Planning text", tool_calls=[{"id": "unfinished", "name": "web_search", "args": {}}]),
     ToolMessage(content="This is a tool output, not a memo", tool_call_id="unfinished"),
 ])
-def test_empty_or_nonfinal_message_recovers_from_actual_sources_once(last, capsys):
+@pytest.mark.parametrize("request_timeout", [17, 60])
+def test_empty_or_nonfinal_message_recovers_from_actual_sources_once(last, request_timeout, monkeypatch, capsys):
+    configured = get_settings().model_copy(update={"model_request_timeout_seconds": request_timeout})
+    monkeypatch.setattr("app.agents.researcher.get_settings", lambda: configured)
     researcher, calls, budgets = researcher_with(last)
     result = researcher.research(task())
     assert "- 方法使用子目标" in result.memo
@@ -73,7 +77,7 @@ def test_empty_or_nonfinal_message_recovers_from_actual_sources_once(last, capsy
     text = calls[1][1][1].text
     assert "Source method uses subgoals." in text and "CURRENT_QUESTION" in text
     assert "MEMO FINALIZATION" in text
-    assert "tools" not in calls[1][2] and 0 < calls[1][2]["timeout"] <= 60
+    assert "tools" not in calls[1][2] and 0 < calls[1][2]["timeout"] <= request_timeout
     assert budgets[0].search_calls == budgets[0].fetch_calls == 0  # Factory returns artifacts, no repeated executions.
     bundle = result.evidence_bundle
     assert bundle and len(bundle.claims) == len(bundle.evidence) == len(bundle.sources) == 1
