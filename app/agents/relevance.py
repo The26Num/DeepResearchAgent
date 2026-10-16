@@ -1,6 +1,5 @@
 """One run-wide relevance pass, bounded into small tool-free structured batches."""
 
-import json
 from collections import Counter
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -12,6 +11,7 @@ from openai import APITimeoutError, BadRequestError, LengthFinishReasonError
 
 from app.config import Settings, get_settings
 from app.llm import bounded_output_options, create_verifier_llm
+from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 from app.research.relevance_context import RelevanceContext, split_relevance_batches
 from app.research.runtime import ResearchRuntime
 from app.schemas.claim import Claim
@@ -110,6 +110,7 @@ class RelevanceAssessor:
 
                 remaining = runtime.remaining()
                 options = bounded_output_options(self.model, self.settings.relevance_max_tokens)
+                options.update(json_object_options(self.model))
                 # Leave time for the one retry; never extend the run-wide deadline.
                 options["timeout"] = min(self.settings.model_request_timeout_seconds,
                                          remaining / (2 - timeout_retries))
@@ -150,7 +151,7 @@ class RelevanceAssessor:
             return response
 
         response = None
-        if self._native_available:
+        if self._native_available and not prefers_json_object(self.model):
             try:
                 structured = self.model.with_structured_output(schema, method="json_schema")
                 response = invoke(structured, messages)
@@ -165,13 +166,11 @@ class RelevanceAssessor:
                 self._native_available = False
                 runtime.log("native relevance JSON Schema unavailable; using schema-validated JSON")
         if response is None:
-            request = [SystemMessage(content=self.prompt + "\nReturn only JSON matching:\n"
-                                      + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))), messages[1]]
+            if prefers_json_object(self.model):
+                runtime.log("relevance output mode=json_object; thinking disabled")
+            request = [SystemMessage(content=self.prompt + json_instance_instructions(schema)), messages[1]]
             raw = invoke(self.model, request)
-            text = raw.text.strip()
-            if text.startswith("```") and text.endswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            parsed = BatchClaimRelevance.model_validate_json(text)
+            parsed = BatchClaimRelevance.model_validate(parse_json_instance(raw.text))
         else:
             parsed = BatchClaimRelevance.model_validate(response)
         labels = [item.claim_id for item in parsed.results]

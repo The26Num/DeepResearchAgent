@@ -205,10 +205,10 @@ def test_native_structured_output_and_single_json_compatibility_fallback(mode):
     assert all(not key.startswith("_") for item in sent["evidence_candidates"] for key in item)
 
 
-def test_invalid_output_fails_without_repair_loop():
+def test_invalid_claim_is_omitted_without_repair_loop():
     model = ModelStub(response={"claims": [{"text": "No evidence"}]})
-    with pytest.raises(ValidationError):
-        EvidenceExtractor(model).extract(payload(), ResearchRuntime("D1", 5, 1))
+    result = EvidenceExtractor(model).extract(payload(), ResearchRuntime("D1", 5, 1))
+    assert result.claims == []
     assert len(model.calls) == 1
 
 

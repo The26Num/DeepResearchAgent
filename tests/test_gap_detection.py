@@ -286,7 +286,7 @@ def test_incomplete_duplicate_or_unknown_relevance_labels_fail_closed(mutate):
     assert worker.last_usage.llm_calls == 1
 
 
-@pytest.mark.parametrize("patch", [{"status": "SUPPORTED"}, {"status": "TRUE"}, {"reason": "x" * 161},
+@pytest.mark.parametrize("patch", [{"status": "SUPPORTED"}, {"status": "TRUE"}, {"reason": "x" * 321},
                                    {"reason": " "}, {"search_query": "query"}, {"confidence": 0.9}])
 def test_relevance_schema_rejects_support_status_long_reason_and_extra_fields(patch):
     worker = assessor(ModelStub(mutate=lambda value: {"results": [{**value["results"][0], **patch}]}))
@@ -334,7 +334,7 @@ def test_http_output_limit_timeout_no_tools_and_compatibility_once(native, url):
     assert worker.last_usage.context_chars == sum(len(body["messages"][1]["content"]) for _, body in requests)
     for request, body in requests:
         assert "tools" not in body and "tool_choice" not in body
-        assert body["max_tokens" if "siliconflow" in url else "max_completion_tokens"] == 2048
+        assert body["max_tokens" if "siliconflow" in url else "max_completion_tokens"] == 3072
         assert body["preserved"] is True
         assert 0 < request.extensions["timeout"]["read"] <= 60
         assert "FORMAL_EVIDENCE_ID_NOT_SENT" not in body["messages"][1]["content"]

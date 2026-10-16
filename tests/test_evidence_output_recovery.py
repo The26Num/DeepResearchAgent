@@ -127,9 +127,9 @@ def test_recovery_output_budget_remains_bounded_even_with_largest_configured_lim
     assert [json.loads(request.content)["max_tokens"] for request in requests] == [8192, 8192]
 
 
-def test_default_initial_budget_is_6144_and_recovery_is_capped_at_8192(monkeypatch):
+def test_default_initial_budget_and_recovery_are_bounded_at_8192(monkeypatch):
     settings = Settings(_env_file=None)
-    assert settings.evidence_extraction_max_tokens == 6144
+    assert settings.evidence_extraction_max_tokens == 8192
     monkeypatch.setattr(extraction_module, "get_settings", lambda: settings)
     requests = []
 
@@ -139,7 +139,7 @@ def test_default_initial_budget_is_6144_and_recovery_is_capped_at_8192(monkeypat
 
     with httpx.Client(transport=httpx.MockTransport(transport)) as client:
         EvidenceExtractor(model(client)).extract(payload()[1], ResearchRuntime("A", 300, 15))
-    assert [json.loads(request.content)["max_tokens"] for request in requests] == [6144, 8192]
+    assert [json.loads(request.content)["max_tokens"] for request in requests] == [8192, 8192]
 
 
 def test_schema_candidate_ranges_are_request_local_and_recovery_has_smaller_output_limits():
@@ -147,7 +147,7 @@ def test_schema_candidate_ranges_are_request_local_and_recovery_has_smaller_outp
     assert large["properties"]["selected_evidence_indexes"]["items"]["enum"] == list(range(40))
     assert small["$defs"]["ExtractedClaim"]["properties"]["supporting_evidence_indexes"]["items"]["enum"] == [0, 1]
     assert small["properties"]["claims"]["maxItems"] == 6
-    assert small["$defs"]["ExtractedClaim"]["properties"]["text"]["maxLength"] == 90
+    assert small["$defs"]["ExtractedClaim"]["properties"]["text"]["maxLength"] == 180
     assert large["properties"]["claims"]["maxItems"] == 6
 
 

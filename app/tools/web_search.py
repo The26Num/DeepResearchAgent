@@ -8,7 +8,7 @@ from app.config import get_settings
 from app.research.runtime import bounded_request_timeout
 
 MAX_RESULTS = 8
-MAX_SNIPPET_CHARS = 500
+MAX_SNIPPET_CHARS = 800
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 SEARCH_TIMEOUT = (5, 30)
 

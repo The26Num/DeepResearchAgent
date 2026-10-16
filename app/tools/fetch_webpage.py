@@ -8,11 +8,12 @@ from langchain_core.tools import tool
 
 from app.research.runtime import bounded_request_timeout
 from app.research.discovery_guard import readable_source_urls
+from app.research.page_quality import page_body_error
 
 
 _USER_AGENT = "Mozilla/5.0 (compatible; DeepResearchAgent/0.1; research tool)"
-DEFAULT_MAX_CHARS = 5000
-MAX_ALLOWED_CHARS = 8000
+DEFAULT_MAX_CHARS = 7500
+MAX_ALLOWED_CHARS = 12000
 
 
 @tool
@@ -70,8 +71,8 @@ def fetch_webpage(url: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
             element.decompose()
         main_content = soup.find("main") or soup.find("article") or soup.body or soup
         text = re.sub(r"\s+", " ", main_content.get_text(" ", strip=True)).strip()
-        if not text:
-            errors.append("fetch failed: empty HTML body")
+        if issue := page_body_error(text):
+            errors.append("fetch failed: " + issue)
             continue
         return json.dumps({"url": final_url, "requested_url": url, "title": title,
                            "published_at": published_at, "text": text[:effective_max],

@@ -164,7 +164,7 @@ def test_assertive_heading_is_neutralized_even_if_judge_would_approve_it():
 
 
 def test_fallback_does_not_truncate_an_oversized_claim_or_publish_empty_fact():
-    context = context_for("完整论述。" * 250)
+    context = context_for("完整论述。" * 450)
     gate = checker(Judge("UNSUPPORTED"))
     with pytest.raises(ValueError, match="complete cited Claim"):
         gate.check(report_for(context, "结论有效。"), context)
@@ -268,13 +268,17 @@ def test_real_http_boundary_has_no_tools_and_correct_output_limit(native, host):
 
 
 def test_default_writer_gate_repairs_and_recomputes_coverage_without_research(monkeypatch):
-    context = context_for("方法甲改善探索。", "方法乙降低开销。" + "完整论述。" * 240)
+    context = context_for("方法甲改善探索。", "方法乙降低开销。" + "完整论述。" * 400)
     generated = report_for(context, "方法甲在 Atari 中降低开销。", heading="方法甲的 Atari 表现", refs=["claim_0", "claim_1"])
     class WriterModel:
         def with_structured_output(self, *args, **kwargs):
             return self
         def invoke(self, *args, **kwargs):
-            return generated.model_dump()
+            data=generated.model_dump()
+            for item in [*data['executive_summary'],*data['key_findings'],*data['conclusion'],
+                         *(p for section in data['sections'] for p in section['paragraphs'])]:
+                item['claim_ids']=['C1','C2']
+            return data
     monkeypatch.setattr("app.agents.report_grounding.create_verifier_llm", lambda: Judge())
     writer = ResearchWriter(WriterModel(), settings=Settings(_env_file=None))
     result = writer.write(context)

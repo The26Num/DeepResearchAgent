@@ -9,4 +9,4 @@ UNSUPPORTED：至少有一个陈述超出依据。UNCERTAIN：无法确定完整
 必须核对“哪个主体具有哪个属性”，不能仅因为相关词语都出现在依据中就判为支持。例：依据分别为“方法甲改善探索”和“方法乙降低计算开销”。“方法甲改善探索，方法乙降低计算开销”是 SUPPORTED；“方法甲降低计算开销，方法乙改善探索”是 UNSUPPORTED，因为两种属性被调换；“方法甲在某特定游戏中改善探索”也是 UNSUPPORTED，因为新增了实验环境。标题“方法甲的计算优势”同样不被这些依据支持。
 limitation 项的依据是当前材料的缺口或部分成立的结论，只允许说明材料不足或不确定性，不能据此宣称整个领域缺少研究、方法无效或已经得到确定性结论。
 
-输入 required_item_count 是必须返回的判断数量。items 中每个 item_index 恰好返回一项，按输入顺序列出，不能只判断第一项，不能遗漏、重复或增加。results 的长度必须等于 required_item_count。reason 简短说明，最多 160 字符。只返回符合 schema 的 JSON 对象，顶层为 results 数组，每项包含 item_index、status 和 reason。
+输入 required_item_count 是必须返回的判断数量。items 中每个 item_index 恰好返回一项，按输入顺序列出，不能只判断第一项，不能遗漏、重复或增加。results 的长度必须等于 required_item_count。reason 简短说明，最多 320 字符。只返回符合 schema 的 JSON 对象，顶层为 results 数组，每项包含 item_index、status 和 reason。

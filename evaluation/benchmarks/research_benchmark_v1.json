@@ -1,0 +1,73 @@
+{
+  "benchmark_version": 1,
+  "cases": [
+    {
+      "case_id": "python_cache_001",
+      "question": "比较 Python functools.cache 与 lru_cache：容量与淘汰策略、适用场景，以及线程安全是否意味着相同调用只计算一次。优先使用官方文档。",
+      "category": "software_engineering",
+      "question_type": "comparison",
+      "expected_dimensions": ["容量与淘汰策略", "适用场景与限制", "线程安全和重复计算"],
+      "gold_sources": ["https://docs.python.org/3/library/functools.html"],
+      "notes": "区分缓存数据结构的一致性与并发下只执行一次的保证。"
+    },
+    {
+      "case_id": "sqlite_wal_001",
+      "question": "仅针对单机 SQLite WAL 模式，说明读写并发、仍会出现 SQLITE_BUSY 的情形，以及长读事务如何影响 checkpoint。优先使用官方文档，不扩展为分布式数据库比较。",
+      "category": "computer_systems",
+      "question_type": "narrow_focus",
+      "expected_dimensions": ["读写并发与单写者约束", "SQLITE_BUSY 的适用情形", "长读事务与 checkpoint"],
+      "notes": "测试严格范围及对并发保证的准确限定。",
+      "tags": ["evidence_heavy"]
+    },
+    {
+      "case_id": "rag_eval_001",
+      "question": "调研 2023—2026 年 RAG evaluation 的主要研究方向，区分检索评估、生成忠实性与端到端评估，并说明评估局限。",
+      "category": "machine_learning_ai",
+      "question_type": "discovery",
+      "expected_dimensions": ["检索评估", "生成忠实性", "端到端评估及局限"],
+      "notes": "不要求特定论文出现；明确材料时间范围和缺失。",
+      "tags": ["evidence_heavy"]
+    },
+    {
+      "case_id": "interatomic_001",
+      "question": "调研 2023—2026 年机器学习原子间势在材料模拟中的主要研究方向，涵盖泛化能力、训练数据与物理约束，说明证据适用范围。",
+      "category": "scientific_research",
+      "question_type": "discovery",
+      "expected_dimensions": ["跨材料泛化能力", "数据与计算成本", "物理约束和验证"],
+      "notes": "关注材料模拟方法，不涉及医学决策。"
+    },
+    {
+      "case_id": "wasm_components_001",
+      "question": "总结 2023—2026 年 WebAssembly Component Model 与 WASI 的技术趋势，区分已发布能力、实验性能力与路线图。",
+      "category": "computer_systems",
+      "question_type": "trend",
+      "expected_dimensions": ["组件接口和互操作", "WASI 能力与成熟度", "生态采用及限制"],
+      "notes": "避免将路线图当成已经发布的功能。"
+    },
+    {
+      "case_id": "edge_inference_001",
+      "question": "总结 2023—2026 年端侧大语言模型推理的技术趋势，比较量化、内存优化与运行时支持，并区分实测结果和厂商主张。",
+      "category": "technology_trends",
+      "question_type": "trend",
+      "expected_dimensions": ["量化与精度权衡", "内存和延迟优化", "运行时及硬件限制"],
+      "notes": "不把不同设备或模型的性能数字直接比较。",
+      "tags": ["evidence_heavy"]
+    },
+    {
+      "case_id": "lora_finetuning_001",
+      "question": "比较 LoRA 与全参数微调的机制、显存和训练成本、适用场景及效果局限，说明哪些比较需要相同模型和实验设置。",
+      "category": "machine_learning_ai",
+      "question_type": "comparison",
+      "expected_dimensions": ["训练参数与机制", "显存和训练成本", "效果与适用边界"],
+      "notes": "不硬编码固定准确率或胜负。"
+    },
+    {
+      "case_id": "taskgroup_errors_001",
+      "question": "仅针对 Python asyncio.TaskGroup，解释子任务异常时的取消、异常分组，以及吞掉 CancelledError 的影响。优先使用官方文档。",
+      "category": "software_engineering",
+      "question_type": "narrow_focus",
+      "expected_dimensions": ["子任务失败与兄弟任务取消", "ExceptionGroup 和特殊异常", "CancelledError 的传播"],
+      "notes": "不扩展到其他语言或通用多线程异常处理。"
+    }
+  ]
+}

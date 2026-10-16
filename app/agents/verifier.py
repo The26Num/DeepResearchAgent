@@ -1,21 +1,24 @@
 """Batch evidence-support classification; no Agent, tools, Memo or Store scanning."""
 
-import json
 from collections import Counter
 from dataclasses import dataclass, fields
+import json
 from pathlib import Path
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 from openai import BadRequestError, LengthFinishReasonError
+from pydantic import ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import bounded_output_options, create_verifier_llm
+from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 from app.research.evidence_store import EvidenceStore
 from app.research.runtime import ResearchRuntime
 from app.research.verification_context import VerificationContext, split_verification_batches
 from app.schemas.claim import Claim
-from app.schemas.verification import BatchVerificationResult, VerificationResult, VerificationStatus
+from app.schemas.verification import (MAX_VERIFICATION_REASON_CHARS, BatchVerificationResult,
+                                      VerificationResult, VerificationStatus)
 
 
 class VerificationOutputError(ValueError):
@@ -75,9 +78,9 @@ class ClaimVerifier:
                                   self.settings.research_progress_interval_seconds)
 
         def work():
-            for context in contexts:
+            for index, context in enumerate(contexts, 1):
                 with runtime.operation("claim verification"):
-                    result = self._classify(context, runtime)
+                    result = self._classify(context, runtime, batch_index=index, batch_count=len(contexts))
                     for claim in context.claims:
                         decision = result[claim.claim_id]
                         decisions[claim.claim_id] = self._result(claim, decision.status, decision.reason)
@@ -95,7 +98,8 @@ class ClaimVerifier:
         return VerificationResult(claim_id=claim.claim_id, task_id=claim.task_id, status=status,
                                   reason=reason, evidence_ids=list(claim.evidence_ids))
 
-    def _classify(self, context: VerificationContext, runtime: ResearchRuntime) -> dict:
+    def _classify(self, context: VerificationContext, runtime: ResearchRuntime, *,
+                  batch_index: int = 1, batch_count: int = 1) -> dict:
         if self.model is None:
             self.model = create_verifier_llm()
         schema = BatchVerificationResult.model_json_schema()
@@ -106,6 +110,8 @@ class ClaimVerifier:
         usage = self.last_usage
         usage.batches += 1
         calls_before = usage.llm_calls
+        format_retry = 0
+        retry_limit = int(prefers_json_object(self.model))
 
         def invoke(model, messages):
             raw_messages = []
@@ -117,9 +123,13 @@ class ClaimVerifier:
                             raw_messages.append(getattr(generations[0], "message", None))
 
             options = bounded_output_options(self.model, self.settings.verification_max_tokens)
+            options.update(json_object_options(self.model))
             options["timeout"] = min(self.settings.model_request_timeout_seconds, runtime.remaining())
             if runtime.call_budget is not None:
                 runtime.call_budget.reserve("verification")
+            runtime.log(f"verification batch {batch_index}/{batch_count}: claims={len(context.claims)} "
+                        f"context_chars={context.context_chars} format_retry={format_retry}/{retry_limit} "
+                        f"request_timeout={options['timeout']:.2f}s")
             usage.llm_calls += 1
             usage.context_chars += context.context_chars
             try:
@@ -141,7 +151,7 @@ class ClaimVerifier:
             return response
 
         response = None
-        if self._native_available:
+        if self._native_available and not prefers_json_object(self.model):
             try:
                 # include_raw=True adds a RunnableMap that does not forward invoke
                 # kwargs to its model branch in the installed LangChain version.
@@ -159,13 +169,36 @@ class ClaimVerifier:
                 self._native_available = False
                 runtime.log("native verification JSON Schema unavailable; using schema-validated JSON")
         if response is None:
-            fallback = [SystemMessage(content=self.prompt + "\nReturn only JSON matching:\n"
-                                      + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))), request[1]]
-            raw = invoke(self.model, fallback)
-            text = raw.text.strip()
-            if text.startswith("```") and text.endswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            parsed = BatchVerificationResult.model_validate_json(text)
+            if prefers_json_object(self.model):
+                runtime.log("verification output mode=json_object; thinking disabled")
+            contract = (f"\nresults must contain exactly {len(context.claims)} JSON objects, one for each label "
+                        f"in {json.dumps(list(context.claim_ids))}. Never place strings or field names in the array. "
+                        f"Each reason must be at most {MAX_VERIFICATION_REASON_CHARS} CHARACTERS, not words; "
+                        f"aim for {MAX_VERIFICATION_REASON_CHARS // 2} characters. "
+                        "State the key support or limitation without copying IDs or quotes.\n")
+            fallback = [SystemMessage(content=self.prompt + json_instance_instructions(schema) + contract), request[1]]
+            for format_retry in range(retry_limit + 1):
+                raw = invoke(self.model, fallback)
+                try:
+                    parsed = BatchVerificationResult.model_validate(parse_json_instance(raw.text))
+                    break
+                except ValidationError as error:
+                    if not retry_limit:
+                        raise
+                    issues = "; ".join(".".join(map(str, item["loc"])) + ":" + item["type"]
+                                       for item in error.errors(include_input=False, include_url=False)[:6])[:400]
+                    if format_retry == retry_limit:
+                        raise VerificationOutputError(
+                            f"Verification batch {batch_index}/{batch_count} failed schema validation after "
+                            f"one format retry ({issues}); no decisions saved."
+                        ) from error
+                    # Reclassify the same complete evidence input. Never drop bad
+                    # rows or truncate reasons into apparently valid decisions.
+                    runtime.log(f"verification batch {batch_index}/{batch_count}: schema validation failed "
+                                f"({issues}); retrying current batch once")
+                    fallback = [SystemMessage(content=fallback[0].content + "\nFORMAT CORRECTION: " + issues
+                                              + ". Return a complete fresh result for the same input; "
+                                                "all IDs and support criteria remain unchanged.\n"), request[1]]
         else:
             parsed = BatchVerificationResult.model_validate(response)
         ids = [item.claim_id for item in parsed.results]

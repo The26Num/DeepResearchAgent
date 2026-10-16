@@ -33,8 +33,8 @@ from app.tools.fetch_webpage import fetch_webpage
 
 _PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "researcher.md"
 _URL = re.compile(r"https?://[^\s)>]+")
-MAX_RESEARCH_INPUT_CHARS = 28000
-MAX_ARTIFACT_AND_SUMMARY_CHARS = 16000
+MAX_RESEARCH_INPUT_CHARS = 42000
+MAX_ARTIFACT_AND_SUMMARY_CHARS = 24000
 MAX_AGENT_STEPS = 40
 
 
@@ -200,8 +200,8 @@ class Researcher:
             if "error" not in page and isinstance(text, str) and text.strip():
                 successful.append({
                     "url": str(page.get("url") or url),
-                    "title": str(page.get("title") or "")[:180],
-                    "text": text.strip()[:2500],
+                    "title": str(page.get("title") or "")[:300],
+                    "text": text.strip()[:4000],
                 })
             else:
                 failed.append({"url": url, "error": str(page.get("error") or "empty page body")[:240]})
@@ -220,7 +220,7 @@ class Researcher:
             f"fetch_webpage: {budget.fetch_calls}/{budget.max_fetch_calls} used, "
             f"{budget.max_fetch_calls - budget.fetch_calls} remaining.\n"
         )
-        available = min(8000, MAX_RESEARCH_INPUT_CHARS - len(self.system_prompt) - len(request) - len(header))
+        available = min(12000, MAX_RESEARCH_INPUT_CHARS - len(self.system_prompt) - len(request) - len(header))
         payload = {"successful_readings": successful, "failed_readings": failed}
         while len(encoded := json.dumps(payload, ensure_ascii=False)) > available:
             if all(len(item["text"]) <= 100 for item in successful):
@@ -265,7 +265,7 @@ class Researcher:
             "State specific gaps when these sources do not answer the question. "
             "Use the four required Chinese sections, including comparisons for synthesis.\n"
         )
-        readings = [{"url": page["url"], "title": page.get("title", ""), "text": page["text"][:2500]}
+        readings = [{"url": page["url"], "title": page.get("title", ""), "text": page["text"][:4000]}
                     for page in budget.readings[:4]]
         while True:
             final_request = request + instruction + json.dumps({"successful_readings": readings}, ensure_ascii=False)

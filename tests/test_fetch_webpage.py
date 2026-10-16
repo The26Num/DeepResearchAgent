@@ -70,8 +70,8 @@ def test_default_and_hard_cap_clean_long_html(monkeypatch) -> None:
     monkeypatch.setattr(fetch_module.requests, "get", lambda *args, **kwargs: Response())
     default = json.loads(fetch_module.fetch_webpage.invoke({"url": "https://example.org/page"}))
     oversized = json.loads(fetch_module.fetch_webpage.invoke({"url": "https://example.org/page", "max_chars": 50000}))
-    assert len(default["text"]) == 5000
-    assert len(oversized["text"]) == 8000
+    assert len(default["text"]) == 7500
+    assert len(oversized["text"]) == 12000
     assert "SIDEBAR" not in oversized["text"]
     assert "REFERENCES" not in oversized["text"]
     assert "COOKIES" not in oversized["text"]

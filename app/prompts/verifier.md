@@ -17,5 +17,6 @@ success rate alone never proves superiority. Do not treat method descriptions as
 Return exactly one decision per supplied claim_id, with no extra or duplicate IDs.
 claim_id values such as C1/C2 are batch-local labels: copy them exactly; never invent or renumber them.
 Each decision has ONLY claim_id, status (SUPPORTED/PARTIAL/UNSUPPORTED), and reason.
-Reason: one or two short sentences, at most 200 characters, stating the evidence support or limitation.
+Reason: aim for one concise sentence; the hard limit is 400 characters, not 400 words.
+State only the key evidence support or limitation, without repeating Evidence/Source IDs or quotes.
 Do not repeat evidence/source text, rewrite claims, assign confidence, or propose research/gaps.

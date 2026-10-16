@@ -4,7 +4,7 @@
 
 DeepResearch Agent 是一个面向证据驱动研究的命令行项目：将开放式问题规划为研究任务，搜索并读取外部来源，再经过分析与综合输出研究摘要。
 
-当前已完成 **Phase 1 — Research 基础链路**、**Phase 2 — Parallel Research**、**Phase 3 — Evidence System**、**Phase 4 — Verifier Loop**、**Phase 5 — Writer + Citation** 和 **Phase 6 — Persistence / Checkpoint / Resume**。系统动态生成研究 DAG，并行研究，验证证据支持与目标相关性，在预算内补研究，最后用合格 Claim 生成结构化报告，再由程序生成编号引用和 References。CLI 默认把安全边界的 JSON 快照保存到 SQLite，支持按 Run ID 显式恢复。
+当前已完成 **Phase 1 — Research 基础链路**、**Phase 2 — Parallel Research**、**Phase 3 — Evidence System**、**Phase 4 — Verifier Loop**、**Phase 5 — Writer + Citation**、**Phase 6 — Persistence / Checkpoint / Resume** 和 **Phase 7 — Evaluation & Benchmarking**。系统动态生成研究 DAG，并行研究，验证证据支持与目标相关性，在预算内补研究，最后用合格 Claim 生成结构化报告，再由程序生成编号引用和 References。CLI 默认把安全边界的 JSON 快照保存到 SQLite，支持按 Run ID 显式恢复；独立 Evaluation CLI 提供跨领域基准、指标向量及 Baseline 对比。
 
 ## Features / 当前能力
 
@@ -18,6 +18,7 @@ DeepResearch Agent 是一个面向证据驱动研究的命令行项目：将开�
 - 证据报告：Writer 只读消费 `SUPPORTED + ALIGNED` Claim，发布前批量检查段落和标题是否被所引用的 Claim 支持；不通过时保守回退。正文保留 Claim → Evidence → Source 关联，分别统计写作与语义核验用量。
 - 确定性引用：按最终报告正文首次使用 Source 的顺序分配 `[1][2]`，从 Store 元数据生成去重 References，完整性检查通过后才打印报告；citation 模型调用及输入/输出 tokens 均为 0。
 - 持久化恢复：CLI 为研究生成 Run ID，以 SQLite 保存安全 JSON 快照；可按 ID 恢复并跳过已完成任务/阶段，保留证据 ID、去重状态和补研究预算。
+- 外部评估：版本化跨领域 Benchmark、只读质量与效率指标、独立 Search-Summarize Baseline、可选单次 Judge，以及 JSONL/JSON/CSV 对比结果。
 
 ## Development Phases / 开发阶段
 
@@ -282,11 +283,11 @@ flowchart TD
 - 每批 Researcher 仍按 Phase 2 并行执行；成功 Bundle 统一 merge 到 Global EvidenceStore 后，按 Task 串行批量验证。默认每 Task 最多 6 条 Claim 一次调用，不按 Claim 单独调用；空任务跳过。
 - [ClaimVerifier](app/agents/verifier.py) 直接调用无工具的模型，不创建搜索 Agent。独立 [verifier prompt](app/prompts/verifier.md) 只判断当前引用证据的相关性、直接支持、范围、强度、比较及实验条件，不用模型先验知识补全。
 - [Compact context builder](app/research/verification_context.py) 只按 Claim 的 `evidence_ids` 查询正式 Evidence 及最少 Source 元数据（title、url、source_type）。同一 batch 的 Evidence 正文与 Source 元数据各传一次，Claim 只保留引用；不传 Memo、dependency memo、搜索结果、网页全文或整个 Store。A/S 可以引用 D1/D2 等上游 Evidence，不要求同任务来源。
-- `MAX_VERIFY_CLAIMS_PER_BATCH=6`，`MAX_VERIFICATION_CONTEXT_CHARS=12000`。字符额度指 compact 数据 JSON（不含固定系统提示和 Schema）。按数量和长度贪心拆批；不删除 Claim、不删引用、不截断 Evidence。单个完整支持链仍超预算时，在任何 API 请求之前明确报错，需调整预算。
-- 模型只输出 `claim_id/status/reason`，reason 最多 200 字符。输入中的 Claim 使用批内 `C1/C2` 短标签，动态 Schema 限定可选标签，程序验证完整集合后映射回正式 Claim ID，减少 token 与长 UUID 抄写错误。状态仅 `SUPPORTED`、`PARTIAL`、`UNSUPPORTED`，分别表示完整支持、较弱/部分支持、无核心支持或矛盾；不是 TRUE/FALSE 或置信分数。模型返回漏项、重复/陌生标签、非法状态或超长 reason 时拒绝整项任务的验证结果，不伪造状态。
+- `MAX_VERIFY_CLAIMS_PER_BATCH=6`，`MAX_VERIFICATION_CONTEXT_CHARS=18000`。字符额度指 compact 数据 JSON（不含固定系统提示和 Schema）。按数量和长度贪心拆批；不删除 Claim、不删引用、不截断 Evidence。单个完整支持链仍超预算时，在任何 API 请求之前明确报错，需调整预算。
+- 模型只输出 `claim_id/status/reason`，reason 最多 400 字符。输入中的 Claim 使用批内 `C1/C2` 短标签，动态 Schema 限定可选标签，程序验证完整集合后映射回正式 Claim ID，减少 token 与长 UUID 抄写错误。状态仅 `SUPPORTED`、`PARTIAL`、`UNSUPPORTED`，分别表示完整支持、较弱/部分支持、无核心支持或矛盾；不是 TRUE/FALSE 或置信分数。模型返回漏项、重复/陌生标签、非法状态或恢复后仍超长的 reason 时拒绝整项任务的验证结果，不伪造状态。
 - 程序预检查：无引用的 legacy/debug Claim 直接 `UNSUPPORTED`，不调用模型；正式 Phase 3 Claim 仍要求至少一个 Evidence。未知 Evidence/Source 直接报引用完整性错误。默认先检查全部拆批，再调用模型。
-- 优先原生 JSON Schema；服务明确不支持时，最多切换一次纯 JSON + Pydantic 校验，并在本 Verifier 实例中记住不支持，后续 batch 不重复探测。日志按实际请求计数，因此首次兼容回退可能额外增加 1 次请求。格式错误、截断或超时不触发逐 Claim 重试；模型客户端自动重试为 0。
-- `VERIFICATION_MAX_TOKENS=2048` 限制每次输出；每任务验证总时限 `VERIFICATION_TIMEOUT_SECONDS=120`，单次 HTTP 请求还受 `MODEL_REQUEST_TIMEOUT_SECONDS` 与剩余时限约束。通过回调收集 provider 提供的 token usage，不修改共享 Researcher 模型的请求参数。
+- 优先原生 JSON Schema；服务明确不支持时，最多切换一次纯 JSON + Pydantic 校验，并在本 Verifier 实例中记住不支持，后续 batch 不重复探测。百炼 Qwen3.5 直接走 JSON Object；仅字段结构校验失败允许当前 batch 重新生成一次完整结果，超长 reason 也属于此类，不删坏行、不截断 reason、不重跑已经有效的 batch。纠正请求使用原有完整证据，计入实际调用和补研究预算，并共享验证阶段截止时间；第二次仍不合格则明确失败。未知/遗漏/重复 ID、Schema 回显、截断、超时和服务错误不触发此纠正。模型客户端自动重试为 0。
+- `VERIFICATION_MAX_TOKENS=3072` 限制每次输出；每任务验证总时限 `VERIFICATION_TIMEOUT_SECONDS=120`，单次 HTTP 请求还受 `MODEL_REQUEST_TIMEOUT_SECONDS` 与剩余时限约束。通过回调收集 provider 提供的 token usage，不修改共享 Researcher 模型的请求参数。
 - 可单独设置 `VERIFIER_MODEL_NAME`；不设置时使用 `MODEL_NAME`。`VERIFIER_MODEL_API_KEY` 和 `VERIFIER_MODEL_BASE_URL` 必须成对设置，否则继承研究服务的完整凭据。支持思考开关的百炼 Qwen 默认在 verifier 工厂中设置 `enable_thinking=false`，其他 provider 不附加此参数。
 - [VerificationResult](app/schemas/verification.py) 包含程序生成的 `verification_id`、`claim_id`、`task_id`、`status`、`reason`、原 Claim 的 `evidence_ids`，与 Claim 分离。[VerificationStore](app/research/verification_store.py) 保留同一 Claim 的多次结果，提供 add、latest、按 Claim/Task 查询；不覆盖历史。暂不实现跨请求 fingerprint 缓存，同一 batch 的重复 Claim ID 只验证一次。
 - `ResearchResult.verification_store` 和 `verification_usage` 暴露结果及效率统计。CLI 显示每批 claims、unique_evidence、context_chars、calls，以及任务和运行级状态汇总。运行级 context_chars 累计实际请求的数据 JSON 长度，兼容回退的重复传输也计入。默认不逐条输出 reason；`SHOW_VERIFICATION_DEBUG=true` 可显示。usage 可用时显示输入/输出 token 数及有 usage 的响应数，不能将缺失 usage 当作零 token 消耗。
@@ -301,10 +302,10 @@ flowchart TD
 - 新增独立 [RelevanceAssessor](app/agents/relevance.py) 与 [relevance prompt](app/prompts/relevance.md)。全局研究和 Phase 4A 验证完成后，收集全部 Task 的正式 Claims（包括 Analysis/Synthesis），尽量一次批量判断；不逐 Claim 调用，也不逐 Task 重复判断。
 - 输入为原始用户 query（直接传递，不让模型重写）、相关 Task 的 title/question/description，以及 Claim 的批内短标签、task_id、完整 text。每批 Goal 和 Task 目标只传一次；不传 Evidence、Source、引用 ID、网页全文、Research Memo 或 dependency memo。模型只做目标相关性判断，不重复执行 Evidence → Claim 支持验证。
 - `RelevanceStatus` 仅 `ALIGNED / PARTIAL / MISALIGNED`：分别表示直接帮助回答全局目标及本 Task 核心问题、背景/边缘相关或缺少重要条件、研究对象/设置/目标明显偏离。共享关键词或大领域不足以判 ALIGNED，不从 Task 标题自动补全 Claim 缺失的条件；生产代码与提示无当前测试主题的关键词规则。Claim 未包含来源日期时，本层不臆测时效性。
-- [ClaimRelevanceResult](app/schemas/relevance.py) 与 VerificationResult 分离，包含程序生成的 `relevance_id`、正式 `claim_id`、`task_id`、`status`、`reason`（最多 160 字符）。模型仅输出批内 `claim_id/status/reason`，程序验证完整标签集合后映射回正式 ID；不输出查询、论文建议、计划或置信分数。
-- `MAX_RELEVANCE_CLAIMS_PER_BATCH=12`、`MAX_RELEVANCE_CONTEXT_CHARS=8000`（数据 JSON，不含固定系统提示/Schema）。数量或字符超限就拆批，不截断 Claim、Goal 或 Task 核心目标；单条仍超预算时请求前明确报错。空 Claim 集合不初始化模型、不调用 API。
+- [ClaimRelevanceResult](app/schemas/relevance.py) 与 VerificationResult 分离，包含程序生成的 `relevance_id`、正式 `claim_id`、`task_id`、`status`、`reason`（最多 320 字符）。模型仅输出批内 `claim_id/status/reason`，程序验证完整标签集合后映射回正式 ID；不输出查询、论文建议、计划或置信分数。
+- `MAX_RELEVANCE_CLAIMS_PER_BATCH=12`、`MAX_RELEVANCE_CONTEXT_CHARS=12000`（数据 JSON，不含固定系统提示/Schema）。数量或字符超限就拆批，不截断 Claim、Goal 或 Task 核心目标；单条仍超预算时请求前明确报错。空 Claim 集合不初始化模型、不调用 API。
 - 沿用已验证的原生 JSON Schema → 服务明确不支持时纯 JSON + Pydantic 兼容路径，最多一次能力回退并记住结果。仅模型请求超时允许当前 batch 重试一次，保留本次 pass 已完成的 batch，不重跑 Researcher 或 Verification；原生和 JSON 兼容路径共用这一次超时重试额度。Reason 超长、漏项、重复/陌生 ID、非法状态、截断、鉴权/限流/连接错误直接失败；二次请求超时或阶段总预算耗尽也明确失败，不发布部分 relevance/gaps，不将失败伪造成 MISALIGNED。
-- Relevance 复用独立 verifier 模型工厂及 `VERIFIER_MODEL_*` 配置，默认继承当前研究模型，支持的百炼 Qwen 默认关闭思考。`RELEVANCE_MAX_TOKENS=2048` 限制每次输出，`RELEVANCE_TIMEOUT_SECONDS=180` 是整个 relevance pass（所有 batch、兼容回退和超时重试）的总预算。首次尝试的请求时限为 `min(MODEL_REQUEST_TIMEOUT_SECONDS, 剩余时间 / 2)`，为唯一一次重试预留时间；重试请求受模型请求时限和当时全部剩余时间约束，总截止时间不重置。补研究内每次重试照常计入共享调用预算，预算耗尽后不发送请求。Phase 4A ClaimVerifier、VerificationStatus、Prompt 和抽取逻辑保持不变。
+- Relevance 复用独立 verifier 模型工厂及 `VERIFIER_MODEL_*` 配置，默认继承当前研究模型，支持的百炼 Qwen 默认关闭思考。`RELEVANCE_MAX_TOKENS=3072` 限制每次输出，`RELEVANCE_TIMEOUT_SECONDS=180` 是整个 relevance pass（所有 batch、兼容回退和超时重试）的总预算。首次尝试的请求时限为 `min(MODEL_REQUEST_TIMEOUT_SECONDS, 剩余时间 / 2)`，为唯一一次重试预留时间；重试请求受模型请求时限和当时全部剩余时间约束，总截止时间不重置。补研究内每次重试照常计入共享调用预算，预算耗尽后不发送请求。Phase 4A ClaimVerifier、VerificationStatus、Prompt 和抽取逻辑保持不变。
 - [GapDetector](app/research/gap_detection.py) 消费最新 VerificationResult 与 relevance 结果，用纯程序规则生成 [ResearchGap](app/schemas/gap.py)。每条 Claim 的支持结果必须存在并与 task/Claim/引用匹配，缺失或陈旧结果在 relevance 调用前报数据完整性错误；不重复做支持语义检查。
 - GapType 仅三类：Verification 为 PARTIAL/UNSUPPORTED → `SUPPORT_GAP`；Relevance 为 PARTIAL/MISALIGNED → `RELEVANCE_GAP`；Task 没有任何 `SUPPORTED + ALIGNED` Claim → `COVERAGE_GAP`。同一 Claim 可以同时有 support/relevance gap；SUPPORTED 但 MISALIGNED 仍有 relevance gap。一个有效 Claim 即满足当前最小 Task coverage 条件，这不代表该维度已经全面覆盖。
 - 无 Claim 的 Task 直接生成一个 COVERAGE_GAP，不为该 Task 调用 relevance 模型；有多个无效 Claim 也只生成一个 Task coverage gap。支持缺口和 coverage 计算各新增 **0 次 LLM 调用**；主要新增成本只有 run-wide relevance batch（典型 10 Claims 约 1 次，超预算拆批或服务兼容回退可能增加）。
@@ -324,7 +325,7 @@ Phase 4B 流程：Research → Verify → Detect Gap；默认 CLI 继续进入�
 完整流程：Research → Verify → Gap → Budgeted Re-Research → Verify Again → 新 Claim Relevance → 更新选中 Gap → STOP。
 
 - [GapGroup / Selection](app/research/reresearch.py) 先按原 `task_id` 合并未解决缺口，再按 `COVERAGE_GAP > RELEVANCE_GAP > SUPPORT_GAP` 排序，同优先级保留原任务顺序。每个原任务最多选一组，每组默认最多携带 4 条缺口，每轮默认最多 2 组。未选中的 Gap 保持原状态；不会一个 Gap 生成一个任务。
-- [ReResearchPlanner](app/agents/reresearch_planner.py) 使用便宜的 verifier 模型工厂，一次 batch 生成所有选中组的补充任务。输入只有原目标、原任务 title/description、gap types、少量 missing_information 和关联 Claim 文本，不传 Memo、网页或 EvidenceStore。数据 JSON 默认最多 8000 字符，输出最多 2048 token，总规划时限 60 秒。
+- [ReResearchPlanner](app/agents/reresearch_planner.py) 使用便宜的 verifier 模型工厂，一次 batch 生成所有选中组的补充任务。输入只有原目标、原任务 title/description、gap types、少量 missing_information 和关联 Claim 文本，不传 Memo、网页或 EvidenceStore。数据 JSON 默认最多 12000 字符，输出最多 3072 token，总规划时限 60 秒。
 - 模型只返回 `group_id/title/description`；程序生成 `ReResearchPlan(round_id, selected_gap_ids, tasks)`，以及轻量 `ReResearchTask(ResearchTask)` 的 ID、`origin_task_id/origin_gap_ids`。全部为无依赖 discovery，搜索 query 仍由 Researcher 决定。Planner 不重建原计划，原 DAG 不追加节点。
 - 补研究复用原 Researcher 和 `gather/to_thread` 并行机制，继续受 `max_concurrency` 限制。ToolBudget 从集中配置读取，默认每任务 `web_search <= 2`、`fetch_webpage <= 2`。补研究保留原研究时限和抽取上限。
 - 新 Source/Evidence/Claim merge 到本次运行的同一个 Global EvidenceStore，继续按 canonical Source/Evidence 去重、重映射 ID 并保留 provenance。新 Claim 用 `RR_<原任务>_1` 的 task_id 追踪轮次，不改变 Claim 数据模型或旧 Claim.evidence_ids。
@@ -353,13 +354,14 @@ Phase 4B 流程：Research → Verify → Detect Gap；默认 CLI 继续进入�
 - `PARTIAL`（支持或相关性部分满足）仅进入 `partial_claims_for_limitations_only`，提示 Writer 使用“当前证据或覆盖不足”的措辞。`UNSUPPORTED` 或 `MISALIGNED` Claim 不进入事实和 PARTIAL 输入；当前 Gap 可描述本次材料的不足，不能把待证实内容当事实。
 - Writer 不读取 Research Memo、CompactResearchResult、原始工具历史或整页正文。`WritingClaim` 保存 `claim_id/text/evidence_ids/source_ids/origin_task_id`，完整引用留在 Store 和只读视图中。
 - `WritingContext` 仅包含原始 goal、原计划研究维度、accepted Claims、去重的 Evidence 短摘录、最少 Source 元数据（标题/URL/日期）、`OPEN/IMPROVED` Gaps 和 PARTIAL limitations。`RESOLVED` Gap 不作为当前缺陷传入。
-- 每 Claim 默认最多提供前 3 条 Evidence，每片段最多 400 字符。超过上下文预算时先减到每 Claim 1 条，再缩短摘录；保留每个 accepted Claim 的完整文本和 Store 原始引用。仍超限则在请求前明确失败，不静默删除 Claim。
-- [ResearchWriter](app/agents/writer.py) 只调用无工具模型，使用独立客户端、输出上限和阶段截止时间，默认继承当前研究模型。优先一次 JSON Schema structured call；仅接口不支持时允许一次 JSON 兼容回退，没有 outline/revise/search 循环。截断、未知 ID 或无效结构明确失败，不重新研究。
+- 每 Claim 默认最多提供前 3 条 Evidence，每片段最多 600 字符。超过上下文预算时先减到每 Claim 1 条，再缩短摘录；保留每个 accepted Claim 的完整文本和 Store 原始引用。仍超限则在请求前明确失败，不静默删除 Claim。
+- [ResearchWriter](app/agents/writer.py) 只调用无工具模型，使用独立客户端、输出上限和阶段截止时间，默认继承当前研究模型。[WriterReferences](app/research/writer_references.py) 将 accepted Claim、PARTIAL Claim 和 Gap 分别编码为 C/P/G 短标签，按引用字段严格解码；未知标签、跨池引用、直接返回正式 ID 或正文泄漏内部标签均拒绝，不做模糊匹配。正式 ID 与完整引用仍保存在原 Store 和 WritingContext，只有发给模型的视图使用标签。
+- Writer 的格式、结构、引用或截断错误仅允许一次完整纠正，共享原截止时间，不重新研究。纠正后仍不合格就丢弃整份生成稿，从 accepted Claim 原文构建保守报告，使用中性标题和程序生成的缺口说明。保守回退不调用写作或语义模型；逐字事实通过程序审计，引用仍由 Phase 5B 解析。无法原样安全放入报告的 Claim 留在 Store，并记录 omitted_claim_ids；全部无法展示时输出明确的材料不足报告。API/鉴权/请求超时等服务异常保留明确错误，不无限重试。
 - [ResearchReport](app/schemas/report.py) 的七个字段 `title/executive_summary/scope/key_findings/sections/limitations/conclusion` 全部必填。摘要、Finding、详细分析段落和结论均保存非空 `claim_ids`；limitation 保存输入中的 `gap_ids` 和/或 `partial_claim_ids`。输出后检查所有关联，并拒绝正文中的内部 ID、编号引用、作者年份引用、URL 和 References。模型遗漏所有局限性时，程序只用当前 Gap/PARTIAL 状态补上材料不足说明，不增加事实或 LLM 调用。
 - [ReportGroundingChecker](app/agents/report_grounding.py) 在结构和 ID 校验之后，批量核验摘要、发现、分析、结论及限制说明。每段只能使用其明确引用的 Claim 文本，不能借其他 accepted Claim 补证。事实检查不接收研究目标、任务标题、Memo、网页或 Evidence，也没有工具。限制说明只用其引用的当前 Gap/PARTIAL 状态，不能把材料缺口写成整个领域没有研究。
 - 任务目标只作为程序生成的标题和 scope 中明确标注的研究范围，不作为实验依据。章节标题采用更保守的程序规则：只保留该节所引 Claim 原文（允许省略句末标点）或中性组织标题，其他标题改为“研究发现”，不依赖弱模型的批准。规则检查先拦截所引用 Claim 中没有的新名称/缩写、数字、在线/离线和连续/离散控制设定；其余正文交给语义核验，检查方法属性归属、范围、因果和效果强度。相同表述及依据去重，逐字保留单条 Claim 的段落无需额外模型判断。规则比较较保守，可能将合理改写也回退。
-- `UNSUPPORTED/UNCERTAIN` 段落确定性替换为其引用的完整 Claim，超长 Claim 不截断；若全部无法完整容纳则明确失败。未通过的章节标题改为中性“研究发现”，限制说明回退为材料不足表述。核验超时、截断、无效 JSON、遗漏/重复/未知编号或上下文超限时，所有未确认内容同样回退，不能直接放行原文。没有第二轮 Writer 或重新研究。
-- 写作与核验各有独立截止时间和 Token 上限。通常为 1 次写作 + 1 次批量核验；各阶段仅在结构化接口不支持时允许一次 JSON 兼容回退。核验不占补研究预算，另行记录调用与 Token。语义模型仍可能误判，这一发布门不能修复上游已接受 Claim 自身的错误。
+- `UNSUPPORTED/UNCERTAIN` 段落确定性替换为其引用的完整 Claim，超长 Claim 不截断；若分组无法完整容纳或修复后仍不合法，Writer 改用上述整份保守报告。未通过的章节标题改为中性“研究发现”，限制说明回退为材料不足表述。核验超时、截断、无效 JSON、遗漏/重复/未知编号或上下文超限时，所有未确认内容同样回退，不能直接放行原文。没有语义核验循环或重新研究。
+- 写作与核验各有独立截止时间和 Token 上限。通常为 1 次写作 + 1 次批量核验；格式纠正最多额外 1 次写作，原生优先路径的接口兼容探测可能另有 1 次失败请求，Qwen3.5 不做该探测。核验不占补研究预算，另行记录调用与 Token。WriterUsage 记录 format_retries、fallback_mode、fallback_reason 和 omitted_claim_ids，旧 Checkpoint 缺少这些字段时使用默认值，不修改 state_version。语义模型仍可能误判，这一发布门不能修复上游已接受 Claim 自身的错误。
 - 以最终报告（包括保守回退后）事实段落引用的唯一 Claim ID 统计 `accepted/used/unused/coverage`；覆盖率低于 `MIN_WRITER_CLAIM_COVERAGE=0.6` 仅警告，不自动重写。无 accepted Claim 时两个模型都不初始化、不发送请求，直接生成材料不足的最小报告并列出当前 Gap。
 - Writer 不创建/修改 Evidence、Claim、Verification、Relevance 或 Gap。CLI 在 Phase 4 摘要之后打印 `FINAL RESEARCH REPORT`，默认隐藏内部 ID，`SHOW_WRITER_DEBUG=true` 可查看关联。结构化结果在 `ResearchResult.report`，同时返回 `writer_usage/writing_context/report_grounding`。审计记录包含片段路径、原文、最终文字、所用 Claim、判断理由及是否回退；`writer_usage.grounding` 和 `Report Grounding Summary` 单独记录核验用量。
 
@@ -398,17 +400,27 @@ Phase 5 仅输出 Markdown / CLI text；不实现 APA/BibTeX、PDF/DOCX/HTML 导
 - Failure Recovery：普通异常标记 `FAILED`，Ctrl+C 标记 `INTERRUPTED`，保留最后安全快照。恢复前检查版本、引用链、任务结果与完成阶段。`WRITER_COMPLETED` 包含 grounding；已完成 Writer/Citation 不再执行，已完成 Run 直接显示已有报告。
 - No secret persistence：明确列出可存状态，不序列化 Settings/.env/headers；已配置密钥还用于持久化文本与错误信息脱敏。SQLite/WAL/SHM 文件均在 Git ignore 中。
 
-详细表结构、恢复规则、32 项交付说明与验收记录见 [Phase 6 Persistence](docs/phase6-persistence.md)。Phase 7/8 未提前实现。
+详细表结构、恢复规则、32 项交付说明与验收记录见 [Phase 6 Persistence](docs/phase6-persistence.md)。
 
 ### Phase 7 — Evaluation
 
-**Status: Planned**
+**Status: Completed**
 
-- **Goal / 目标：** 定量评估研究系统的质量与执行表现。
-- **Planned Scope / 计划范围：** Benchmark、Quantitative Evaluation、可重复的评测流程。
-- **Completion Criteria / 预期验收：** 在固定问题集合上比较研究质量、覆盖度与运行表现。
+- Benchmark Dataset：当前实验使用 V2，包含 `offline_rl_001`（学术研究）与 `china_game_001`（行业研究），各设 4 个覆盖维度；保存 expected dimensions，不硬编码最终答案。V1 的 8 个技术类 Case 保留供历史实验复现。
+- Deterministic Quality Metrics：support/alignment/publishable、Evidence/Source 复用与利用率、Task/Claim coverage、Citation integrity、Grounding repair、Gap 修复与补研究产出，以及报告重复与年份诊断。
+- Efficiency Metrics：本地只读 callbacks 记录分阶段 LLM、工具、tokens、usage coverage 和时间；缺失值为 N/A，不伪造完整成本；Research Run 仍通过 Phase 6 持久化。
+- Simple Search-Summarize Baseline：相同主模型、相同 Tavily/Fetch 工具，最多 3 次搜索和 4 次读取，再单次总结；独立于主 Orchestrator。
+- Optional LLM Judge：默认关闭，`--judge` 开启；每 Report 最多 1 call，统一 0–4 rubric，评 relevance/coverage/groundedness/clarity，不修改研究产物。
+- Full vs Baseline Comparison：输出每 Case 指标向量、共享指标差值及有样本数的均值，不生成主观总分。保存 config、cases.jsonl、summary.json、CSV 与报告。
 
-当前工程单元测试用于验证程序行为，不等同于研究质量 Benchmark 或 Evaluation 系统。
+```powershell
+python evaluate.py evaluation/benchmarks/research_benchmark_v2.json --limit 2
+python evaluate.py evaluation/benchmarks/research_benchmark_v2.json --mode compare --limit 2
+# 开启共享内容质量比较：
+python evaluate.py evaluation/benchmarks/research_benchmark_v2.json --mode compare --limit 2 --judge
+```
+
+单题可用 `--case offline_rl_001` 或 `--case china_game_001`。单 Case 失败后继续下一题；每次实验创建新 Run，已保存研究可用 `main.py --resume RUN_ID` 恢复。评估只读消费已有结果，研究核心逻辑不变。指标定义、缺失用量规则、32 项交付核对与真实实验记录见 [Phase 7 Evaluation](docs/phase7-evaluation.md)。
 
 ### Phase 8 — UI + Docker + README
 
@@ -467,12 +479,12 @@ macOS/Linux 的激活命令为 `source .venv/bin/activate`。
 
 ```dotenv
 MODEL_API_KEY=replace-with-your-api-key
-MODEL_NAME=qwen3.7-flash
+MODEL_NAME=qwen3.5-flash
 MODEL_BASE_URL=https://<your-workspace-id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 TAVILY_API_KEY=replace-with-your-api-key
 MODEL_REQUEST_TIMEOUT_SECONDS=60
 EVIDENCE_EXTRACTION_TIMEOUT_SECONDS=120
-EVIDENCE_EXTRACTION_MAX_TOKENS=6144
+EVIDENCE_EXTRACTION_MAX_TOKENS=8192
 EVIDENCE_EXTRACTION_ENABLE_THINKING=false
 MODEL_MAX_RETRIES=0
 RESEARCH_TASK_TIMEOUT_SECONDS=300
@@ -485,14 +497,14 @@ SHOW_EVIDENCE_DEBUG=false
 | `RESEARCH_DB_PATH` | CLI 的 SQLite 文件路径，可由 `--db-path` 覆盖。 | `workspace/research.db` |
 | `MODEL_API_KEY` | OpenAI 兼容模型服务密钥，与 `MODEL_BASE_URL` 成对配置，优先于旧版 SiliconFlow 配置。 | 无 |
 | `MODEL_BASE_URL` | 模型服务的 OpenAI 兼容 API 地址；百炼填写控制台提供的工作空间地址。 | 无 |
-| `MODEL_NAME` | 对应服务支持的模型 ID，例如 `qwen3.7-flash`；运行研究时必填，模型需支持工具调用。 | 无 |
+| `MODEL_NAME` | 对应服务支持的模型 ID，例如 `qwen3.5-flash`；运行研究时必填，模型需支持工具调用。 | 无 |
 | `SILICONFLOW_API_KEY` | 旧版 SiliconFlow 密钥，仅在两个通用配置项均为空时使用。 | 无 |
 | `SILICONFLOW_BASE_URL` | 旧版 SiliconFlow 模型服务地址。 | `https://api.siliconflow.cn/v1` |
 | `TAVILY_API_KEY` | Tavily 搜索密钥，执行搜索时必填。 | 无 |
 | `MODEL_REQUEST_TIMEOUT_SECONDS` | 规划及研究模型请求的 HTTP 超时设置。 | `60` |
 | `EVIDENCE_EXTRACTION_TIMEOUT_SECONDS` | 证据抽取单次请求的 HTTP 超时，受任务剩余时间约束。 | `120` |
-| `EVIDENCE_EXTRACTION_MAX_TOKENS` | 证据抽取常规请求生成 token 上限，范围 512–8192；截断恢复最多加倍且不超过 8192。 | `6144` |
-| `EVIDENCE_EXTRACTION_ENABLE_THINKING` | 百炼 Qwen3.7 的证据抽取请求是否开启思考；仅作用于抽取，不修改规划和研究模型的思考模式。 | `false` |
+| `EVIDENCE_EXTRACTION_MAX_TOKENS` | 证据抽取常规请求生成 token 上限，范围 512–8192；截断恢复最多加倍且不超过 8192。 | `8192` |
+| `EVIDENCE_EXTRACTION_ENABLE_THINKING` | 支持开关的百炼 Qwen 证据抽取请求是否开启思考；不修改共享 Researcher 模型。Qwen3.5 的 JSON Object 请求固定关闭思考。 | `false` |
 | `MODEL_MAX_RETRIES` | 模型客户端自动重试次数；不代表自动重跑研究任务。 | `0` |
 | `RESEARCH_TASK_TIMEOUT_SECONDS` | 单项 Researcher 任务的总时间预算，含来源读取及模型调用。 | `300` |
 | `RESEARCH_PROGRESS_INTERVAL_SECONDS` | 任务等待进度输出间隔。 | `15` |
@@ -501,13 +513,13 @@ SHOW_EVIDENCE_DEBUG=false
 | `VERIFIER_MODEL_API_KEY` / `VERIFIER_MODEL_BASE_URL` | 可选验证服务凭据，必须成对配置；均为空时继承研究服务。 | 研究服务配置 |
 | `VERIFIER_ENABLE_THINKING` | 在支持开关的百炼 Qwen 验证模型上控制思考，不影响 Researcher。 | `false` |
 | `MAX_VERIFY_CLAIMS_PER_BATCH` | 每批验证 Claim 上限，范围 1–32。 | `6` |
-| `MAX_VERIFICATION_CONTEXT_CHARS` | 单批 compact JSON 字符预算；超限拆批，不截断证据。 | `12000` |
-| `VERIFICATION_MAX_TOKENS` | 验证单次请求输出上限，范围 512–8192。 | `2048` |
+| `MAX_VERIFICATION_CONTEXT_CHARS` | 单批 compact JSON 字符预算；超限拆批，不截断证据。 | `18000` |
+| `VERIFICATION_MAX_TOKENS` | 验证单次请求输出上限，范围 512–8192。 | `3072` |
 | `VERIFICATION_TIMEOUT_SECONDS` | 一个 Task 的全部 verification batch 总时限。 | `120` |
 | `SHOW_VERIFICATION_DEBUG` | 额外打印逐 Claim 的 status/reason。 | `false` |
 | `MAX_RELEVANCE_CLAIMS_PER_BATCH` | 全局 relevance 每批 Claim 上限，范围 1–48。 | `12` |
-| `MAX_RELEVANCE_CONTEXT_CHARS` | 每批 Goal/Task/Claim 数据 JSON 字符预算，超限拆批。 | `8000` |
-| `RELEVANCE_MAX_TOKENS` | Relevance 单次输出 token 上限，范围 512–8192。 | `2048` |
+| `MAX_RELEVANCE_CONTEXT_CHARS` | 每批 Goal/Task/Claim 数据 JSON 字符预算，超限拆批。 | `12000` |
+| `RELEVANCE_MAX_TOKENS` | Relevance 单次输出 token 上限，范围 512–8192。 | `3072` |
 | `RELEVANCE_TIMEOUT_SECONDS` | 整个 relevance pass 所有 batch、兼容回退及一次批内超时重试的总时限。 | `180` |
 | `SHOW_GAP_DEBUG` | 逐条打印 Gap ID、类型、所属 Task/Claim、描述及缺少的信息。 | `false` |
 | `MAX_RERESEARCH_ROUNDS` | 补研究轮次；当前仅 0 或 1，0 关闭，默认只补一轮。 | `1` |
@@ -516,19 +528,19 @@ SHOW_EVIDENCE_DEBUG=false
 | `MAX_RERESEARCH_LLM_CALLS` | 仅补研究阶段的共享额外模型请求上限，含兼容/恢复调用；0 不发请求。 | `12` |
 | `RERESEARCH_MAX_SEARCH_CALLS` | 每补研究任务搜索上限，最多 2。 | `2` |
 | `RERESEARCH_MAX_FETCH_CALLS` | 每补研究任务读取上限，最多 3。 | `2` |
-| `MAX_RERESEARCH_PLANNING_CONTEXT_CHARS` | Planner 数据 JSON 字符预算，超限请求前停止。 | `8000` |
-| `RERESEARCH_PLANNING_MAX_TOKENS` | Planner 输出 token 上限。 | `2048` |
+| `MAX_RERESEARCH_PLANNING_CONTEXT_CHARS` | Planner 数据 JSON 字符预算，超限请求前停止。 | `12000` |
+| `RERESEARCH_PLANNING_MAX_TOKENS` | Planner 输出 token 上限。 | `3072` |
 | `RERESEARCH_PLANNING_TIMEOUT_SECONDS` | 单次补研究规划阶段总时限（秒）。 | `60` |
-| `MAX_WRITER_CONTEXT_CHARS` | 写作数据 JSON 字符上限，不包含固定 Prompt/Schema；超限先减少 Evidence。 | `24000` |
-| `MAX_REPORT_OUTPUT_TOKENS` | Writer 单次输出 token 硬上限，范围 512–8192。 | `4096` |
+| `MAX_WRITER_CONTEXT_CHARS` | 写作数据 JSON 字符上限，不包含固定 Prompt/Schema；超限先减少 Evidence。 | `36000` |
+| `MAX_REPORT_OUTPUT_TOKENS` | Writer 单次输出 token 硬上限，范围 512–8192。 | `6144` |
 | `MAX_EVIDENCE_PER_WRITING_CLAIM` | 每 Claim 最多传入的 Evidence 条数；不修改 Store 完整引用。 | `3` |
-| `MAX_WRITING_EVIDENCE_CHARS` | Writer 每条 Evidence 摘录字符上限，截断标记随输入提供。 | `400` |
+| `MAX_WRITING_EVIDENCE_CHARS` | Writer 每条 Evidence 摘录字符上限，截断标记随输入提供。 | `600` |
 | `MIN_WRITER_CLAIM_COVERAGE` | 已用唯一 Claim / accepted Claim 的警告阈值。 | `0.6` |
 | `WRITER_TIMEOUT_SECONDS` | 报告生成阶段截止时间；单次请求还受模型请求超时限制。发布前核验另有截止时间。 | `180` |
 | `WRITER_ENABLE_THINKING` | 支持开关的百炼 Qwen Writer 思考模式；默认关闭。 | `false` |
 | `SHOW_WRITER_DEBUG` | 最终报告额外显示 Claim/Gap 内部关联。 | `false` |
-| `MAX_REPORT_GROUNDING_CONTEXT_CHARS` | 去重后的待检查表述与依据 JSON 字符上限，不含固定 Prompt/Schema；超限直接保守回退。 | `24000` |
-| `REPORT_GROUNDING_MAX_TOKENS` | 批量语义核验单次输出上限，范围 512–8192；截断时保守回退。 | `3072` |
+| `MAX_REPORT_GROUNDING_CONTEXT_CHARS` | 去重后的待检查表述与依据 JSON 字符上限，不含固定 Prompt/Schema；超限直接保守回退。 | `36000` |
+| `REPORT_GROUNDING_MAX_TOKENS` | 批量语义核验单次输出上限，范围 512–8192；截断时保守回退。 | `4096` |
 | `REPORT_GROUNDING_TIMEOUT_SECONDS` | 发布前语义核验阶段截止时间；单次请求同时受模型请求超时限制。 | `120` |
 
 Supervisor、Researcher 和 EvidenceExtractor 共用此模型入口。通用密钥和地址必须成对配置，缺少任意一项时直接报错，避免混用不同服务的配置。继续使用 SiliconFlow 时，将 `MODEL_API_KEY`、`MODEL_BASE_URL` 留空，并设置 `SILICONFLOW_API_KEY` 和对应的 `MODEL_NAME`。
@@ -537,7 +549,27 @@ Verifier 使用同一工厂的独立配置入口；默认继承当前研究模�
 
 Writer 使用研究服务与 `MODEL_NAME`，不继承独立 `VERIFIER_MODEL_*` 覆盖。报告语义核验复用 verifier 模型配置，可通过 `VERIFIER_MODEL_*` 独立选择服务；未设置时同样继承当前研究模型。两者客户端自动重试均为 0，各自仅保留一次结构化接口兼容回退。本地已将单次模型请求/Claim 验证阶段分别设置为 120/180 秒；上表是代码默认值，实际以 `.env` 为准。
 
-Supervisor 先尝试 JSON Schema 结构化输出；不支持或校验失败时，请求纯 JSON 并使用 Pydantic 校验。无法获得有效计划时明确报错。
+百炼 `qwen3.5-*` 的结构化阶段直接使用 `response_format={"type":"json_object"}`，并按请求设置 `enable_thinking=false`，避免先发送不支持的原生 JSON Schema 请求。此兼容路径覆盖 Supervisor 计划生成、Evidence Extraction、Verification、Relevance、补研究规划、Writer 和报告 Grounding；Researcher 的普通工具调用不受影响。依据为百炼的 [结构化输出文档](https://help.aliyun.com/zh/model-studio/qwen-structured-output) 和 [深度思考文档](https://help.aliyun.com/zh/model-studio/deep-thinking/)。
+
+JSON Object 保证 JSON 格式，字段与语义仍由程序校验。兼容提示明确区分数据实例与 Schema，给出输出形状和引用白名单；返回 Schema 定义、无效字段或错误引用时拒绝结果，不将其当作空结果成功处理。Writer 中正式 Claim 与仅用于 limitations 的 PARTIAL Claim 仍分开校验，不放宽证据与报告发布约束。其他模型保留原生 JSON Schema 优先及既有兼容回退；Supervisor 无法获得有效计划时明确报错。
+
+### 当前长度额度
+
+2026-10-13 已统一放宽 Schema、提示词、摘录与请求限制。`.env.example` 和当前本地 `.env` 使用上表的新默认值；此前各阶段验收中的额度属于当时配置。
+
+| 内容 | 原上限 | 当前上限 |
+| --- | --- | --- |
+| Verification reason | 200 字符 | 400 字符 |
+| Relevance / Grounding reason | 160 字符 | 320 字符 |
+| 常规 / 恢复抽取 Claim | 160 / 90 字符 | 300 / 180 字符 |
+| Evidence 原文片段 | 2000 字符 | 3000 字符 |
+| 报告标题 / 小标题 | 180 / 150 字符 | 300 / 240 字符 |
+| 报告段落 / scope / limitation | 1200 / 1200 / 600 字符 | 2000 / 2000 / 1000 字符 |
+| 报告主要发现 / 章节 / 每章段落 | 10 / 6 / 4 | 15 / 8 / 6 |
+| 补研究任务 title / description | 180 / 900 字符 | 300 / 1500 字符 |
+| Judge 上下文 / 输出 | 24000 字符 / 3072 token | 36000 字符 / 4096 token |
+
+其余页面读取、压缩摘要、证据传递和输入额度见下文。正文与输入可能变长，实际 token 消耗可能增加；上限不要求模型填满。任务/搜索/补研究调用预算、超时与重试次数保持原设置。ID、字段类型、完整引用及证据支持规则继续严格校验，放宽长度不会修复数组类型等结构错误。
 
 ### 并发配置
 
@@ -561,21 +593,21 @@ result = orchestrator.run("调研 sparse reward offline reinforcement learning �
 每个任务独立计数，工具结果携带剩余预算。超额调用返回明确错误。Agent 每次调用配置 40 步上限，任务总时间预算覆盖该任务的全部调用与补充提醒。
 
 - 搜索默认请求 5 条结果，最多返回 8 条，每条摘要最多 500 字符；Tavily 请求的连接与读取超时分别为 5 秒、30 秒。
-- HTML 正文默认最多 5000 字符、调用硬上限 8000 字符，HTTP 超时设置为 15 秒；analysis 预读每页最多 2500 字符。
-- 当前任务的初始输入（系统提示、任务、依赖上下文与预读正文）最多 28000 字符；预读来源 JSON 内容还受最多 8000 字符的限制。
-- 单个 compact result 的序列化长度目标为最多约 3000 字符，最多 6 条 findings、6 个来源和 4 条不确定信息。
-- 单个压缩摘要依赖块最多 2800 字符；无结构化证据的兼容调用默认总摘要上下文最多 8000 字符。真实 Researcher 的摘要与结构化证据共用 16000 字符预算，优先保留完整证据链；过长时缩减摘要，保留当前问题，无法容纳必要信息时明确报错。
-- 上游结构化证据最多 12000 字符；按依赖任务轮询选择完整 Claim 支持链，最多 12 条 Claim、24 条 Evidence，不切断引用。结构化抽取输入（含提示及当前候选 Schema）最多 48000 字符，每页最多 5000 字符；来源标题和 URL 只传一次，原文候选和编号保持完整。正常请求要求最多 6 条 Claim，每条最多 160 字符及 4 个支持引用；程序仍限制每任务最多 12 条新 Evidence。
+- HTML 正文默认最多 7500 字符、调用硬上限 12000 字符，HTTP 超时设置为 15 秒；analysis 预读每页最多 4000 字符。搜索摘要最多 800 字符。读取工具先检查完整正文：少于 16 个有效字符或短正文明确是浏览器验证/JavaScript 加载壳时返回错误，不作为成功材料；检查在用户指定的摘录截取之前进行。该启发式只排除明显无效页面，不代表页面内容准确或充分。
+- 当前任务的初始输入（系统提示、任务、依赖上下文与预读正文）最多 42000 字符；预读来源 JSON 内容还受最多 12000 字符的限制。
+- 单个 compact result 的序列化长度目标为最多约 4500 字符，最多 8 条 findings、8 个来源和 6 条不确定信息。
+- 单个压缩摘要依赖块最多 4200 字符；无结构化证据的兼容调用默认总摘要上下文最多 12000 字符。真实 Researcher 的摘要与结构化证据共用 24000 字符预算，优先保留完整证据链；过长时缩减摘要，保留当前问题，无法容纳必要信息时明确报错。
+- 上游结构化证据最多 18000 字符；按依赖任务轮询选择完整 Claim 支持链，最多 12 条 Claim、24 条 Evidence，不切断引用。结构化抽取输入（含提示及当前候选 Schema）最多 72000 字符，每页最多 7500 字符；来源标题和 URL 只传一次，原文候选和编号保持完整。正常请求要求最多 6 条 Claim，每条最多 300 字符及 4 个支持引用；程序仍限制每任务最多 12 条新 Evidence。单个 Evidence 原文片段最多 3000 字符。
 
 工具请求超时还会根据任务剩余时间缩短。HTTP 超时限制连接或读取等待，不是整个研究任务的总时限；总时限由 ResearchRuntime 单独管理，包含结构化抽取。任务间传递 compact result 和选取的结构化证据，不传整页正文或前序消息历史。
 
 证据抽取对每次模型调用单独传入请求超时及生成 token 上限，不修改并行任务共享的模型配置。原生 JSON Schema 不可用时的兼容调用重新计算任务剩余时间。日志显示输入字符数、候选数和请求限制；若模型请求仍超时，错误明确指出是摘要生成后的证据抽取失败，不发布不完整 Bundle，并沿用失败后停止下游调度的规则。请求超时不触发自动重跑研究或 JSON 兼容回退。
 
-若服务以 `finish_reason=length` 截断输出，抽取最多恢复一次：保留同一任务与全部原文候选，仍允许最多 6 条 Claim，但缩短为每条最多 90 字符和 3 个引用，并把输出 token 上限调整为配置值的两倍（最低 1024、最高 8192）。百炼 Qwen3.7 默认仅在抽取请求中关闭思考，减少思考 token 对 JSON 生成额度的占用；规划及研究阶段不受影响。每次请求受任务剩余时间约束，不重做搜索，不续接残缺 JSON。原生 Schema 兼容回退最多一次，因此包含截断恢复时，抽取最多发起 3 次模型请求；再次截断会明确失败，不发布残缺结果。
+若服务以 `finish_reason=length` 截断输出，抽取最多恢复一次：保留同一任务与全部原文候选，仍允许最多 6 条 Claim，但缩短为每条最多 180 字符和 3 个引用，并把输出 token 上限调整为配置值的两倍（最低 1024、最高 8192）。支持开关的百炼 Qwen 默认在抽取请求中关闭思考，减少思考 token 对 JSON 生成额度的占用，不修改共享 Researcher 模型。每次请求受任务剩余时间约束，不重做搜索，不续接残缺 JSON。原生 Schema 兼容回退最多一次，因此包含截断恢复时，原生优先路径最多发起 3 次模型请求；Qwen3.5 直接 JSON Object 路径最多 2 次。再次截断会明确失败，不发布残缺结果。
 
 抽取 Schema 为每次请求提供当前合法候选编号的枚举。若服务仍返回越界编号，程序舍弃引用该编号的整条 Claim 及无效独立选项，保留其他完整支持链，并记录候选数量、非法编号和舍弃数量。全部引用无效时不生成正式 Claim 或虚构来源。类型、字段格式和原文来源检查仍然保留。
 
-默认首次抽取使用 6144 token，截断恢复使用 8192 token。设置 `SHOW_EVIDENCE_DEBUG=true` 时，终端还会显示正式 Claim 的 ID、完整 evidence_ids，以及每条 Evidence 的 source_id、来源标题和 URL，便于逐条检查引用链。
+默认首次抽取与截断恢复均最多使用 8192 token；恢复请求改用更紧凑的 180 字符 Claim 和 3 个引用，不突破 token 硬上限。设置 `SHOW_EVIDENCE_DEBUG=true` 时，终端还会显示正式 Claim 的 ID、完整 evidence_ids，以及每条 Evidence 的 source_id、来源标题和 URL，便于逐条检查引用链。
 
 如果研究结束时返回空正文、工具响应或尚未完成的工具调用，Researcher 会记录消息类型与模型结束原因，并最多补写一次 Memo：使用当前任务、已成功读取的页面及依赖上下文，直接调用不带工具的模型，不重复搜索，仍受原有任务总时限和输入长度约束。补写仍为空、返回工具调用或模型明确拒绝时继续明确失败，不使用前面的规划文字充当摘要。
 
@@ -616,7 +648,15 @@ async def research(query: str):
 python -m pytest -q
 ```
 
-当前全部 667 项离线测试通过。测试涵盖计划与依赖校验、上下文压缩、来源去重、工具返回格式和预算，以及并行调度、并发限制、状态隔离、来源预读和超时处理。Phase 3 覆盖证据抽取、完整引用、去重/provenance/回滚和跨任务复用；Phase 4 覆盖批量验证、相关性、缺口、预算补研究及 4B 当前批次的一次超时重试；Phase 5A 的 55 项 Writer 用例及 34 项报告核验用例覆盖只读写作、完整追溯、语义发布门、保守回退、最终覆盖率、用量预算与错误隔离。Phase 5B 的 40 项用例覆盖确定性引用、首次出现编号、完整链路、去重、零 Claim、渲染校验与零模型调用。Phase 6 新增 42 项用例，覆盖真实 SQLite 事务回滚、任务/阶段跳过、重复恢复、完整性和版本拒绝、补研究轮次/预算许可、主线程写入、运行时重建、零合格报告、CLI 和密钥排除。真实研究运行另外需要可用的模型服务、Tavily API Key，以及可访问目标网页的网络。
+当前全部 788 项离线测试通过。测试涵盖计划与依赖校验、上下文压缩、来源去重、工具返回格式和预算，以及并行调度、并发限制、状态隔离、来源预读和超时处理。Phase 3 覆盖证据抽取、完整引用、去重/provenance/回滚和跨任务复用；Phase 4 覆盖批量验证、相关性、缺口、预算补研究及 4B 当前批次的一次超时重试；Phase 5A 的 55 项 Writer 用例及 34 项报告核验用例覆盖只读写作、完整追溯、语义发布门、保守回退、最终覆盖率、用量预算与错误隔离。Phase 5B 的 40 项用例覆盖确定性引用、首次出现编号、完整链路、去重、零 Claim、渲染校验与零模型调用。Phase 6 新增 42 项用例，覆盖真实 SQLite 事务回滚、任务/阶段跳过、重复恢复、完整性和版本拒绝、补研究轮次/预算许可、主线程写入、运行时重建、零合格报告、CLI 和密钥排除。Phase 7 新增 54 项用例，覆盖指标分母、引用与断链检测、跨线程用量回调、缺失 usage、失败 Case 隔离、实际 SQLite Run、Baseline、单次 Judge、脱敏和对比聚合。真实研究运行另外需要可用的模型服务、Tavily API Key，以及可访问目标网页的网络。
+
+**Qwen3.5 兼容修复验收（2026-10-13）：** 新增 24 项离线用例，覆盖七个结构化阶段的真实 SDK/模拟 HTTP 请求、思考开关、调用预算与 usage、Schema 回显拒绝、错误 ID 拒绝、Writer 的 PARTIAL 引用隔离、当前批次超时重试和鉴权错误不重试。真实 `qwen3.5-flash` 小样例通过抽取、验证、相关性、写作、语义核验和引用链路；两次失败运行保存的共 12 条 Claim 也各用一次请求完成核验，原 Checkpoint 未改动。另一个带 PARTIAL Claim 的真实写作样例被引用校验正确拦截，说明 JSON 格式兼容不保证模型遵守全部语义约束。本次未重跑完整 benchmark。
+
+**Verifier 格式纠正验收（2026-10-13）：** 另增 14 项离线用例，复现结果数组混入字符串与 reason 超过 200 字符；验证只重试当前 batch 一次、每批独立额度、二次失败拒绝、引用校验、阶段剩余时间、补研究预算及 usage。真实接口只读复核此次失败的 `offline_rl_001/A1` 和 `china_game_001/D1` 输入，共 11 条 Claim，两批均首次返回有效结果；未修改原 Checkpoint，也未重跑完整 benchmark。输出示例现在列出完整批内 Claim 标签，reason 提示以 80 字符为目标，保留 200 字符硬上限。
+
+**长度额度调整验收（2026-10-13）：** 全量 762 项离线测试通过，新增 3 项真实 SDK/模拟 HTTP 用例，确认 400 字符 Verification reason、320 字符 Relevance/Grounding reason 不会额外触发恢复或 grounding 回退；既有越界用例调整为新上限外的输入并继续拒绝。真实接口只读复核上述两次失败任务的 11 条 Claim，通过核验；其中 A1 的首轮数组结构不合格，由既有一次格式纠正恢复，D1 首次通过。原 Checkpoint 未修改，未重跑完整 benchmark。
+
+**输出容错验收（2026-10-14）：** 新增 26 项回归用例，全量 788 项测试通过。覆盖两条空引用 Claim 的逐条舍弃、全部无效的 coverage gap、容器格式拒绝、C/P/G 隔离、规范 ID 解码、最多一次纠正、无效稿整份丢弃、零模型保守报告、材料不足报告、语义修复失败及旧 WriterUsage 默认值。真实读取四字符页面返回错误。使用当前 `qwen3.5-plus-2026-04-20` 从原失败 Checkpoint 恢复两项研究，两项 Run 均 COMPLETED，引用与持久化结构均通过验证：游戏产业复用全部已完成研究，Writer 两次仍有错误引用后使用原文回退，报告使用全部 14 条 accepted Claim；离线 RL 复用 D1/D2/D3，完成后续研究、写作与核验，使用全部 7 条 accepted Claim。再次恢复两项已完成 Run 均为 0 次模型调用。报告和验收数据位于 `workspace/validations/resilience_20261014/`；本次没有重跑 Baseline/Judge，也不改写原 evaluation 的历史失败记录。
 
 ## Current Limitations / 当前限制
 
@@ -626,8 +666,8 @@ python -m pytest -q
 - Memo 压缩依赖 Markdown 章节规则，模型偏离格式时可能丢失部分来源或细节。Memo 来源按标题轻量去重；Store 按 URL 及已知 arXiv 表示保守匹配身份，不做跨网站论文解析。
 - 初始 DAG 调度按整批等待，一个任务失败后停止后续批次，没有自动重规划或研究任务重试。补研究只有预算内的一轮，失败保留初始结果和未解决缺口，不自动启动替代任务。
 - 任务超时限制调用方等待并阻止后续步骤，不能强行取消正在运行的同步 HTTP 请求；底层请求与框架线程仍需按自身超时收尾。
-- Evidence/Claim 抽取依赖模型；越界候选引用按整条 Claim 舍弃，其他格式错误、原文不匹配、恢复后仍截断或请求超时会明确失败。空的抽取结果不产生正式 Claim，成功的结构化关系也不表示已经完成事实验证。
-- Writer 严格消费上游 `SUPPORTED + ALIGNED` 判断，并增加报告表述的语义核验与规则兜底；核验失败时回退原 Claim，但上游误判和语义核验模型误判仍可能影响报告。规则较保守，回退可能降低语言流畅度。生成超限、结构错误或无效关联时不发布不完整报告，失败不触发新研究。
+- Evidence/Claim 抽取依赖模型；程序先校验容器，再逐条校验 Claim，空引用、错误类型或多余字段等无效行整条舍弃并记录，越界候选引用也舍弃整条 Claim。其他合法行继续生成完整证据链，全部无效时不产生正式 Claim，并形成覆盖缺口。容器错误、原文不匹配、恢复后仍截断或请求超时仍明确失败。成功的结构化关系不表示已经完成事实验证。
+- Writer 严格消费上游 `SUPPORTED + ALIGNED` 判断，并增加报告表述的语义核验与规则兜底；输出错误有一次纠正与确定性原文回退，错误稿不被重新绑定引用后发布。上游误判和语义核验模型误判仍可能影响报告。保守回退可能重复或省略无法安全展示的内容，降低流畅度，且不增加新研究。
 - 已有结构化 Writer、确定性 citation 与 References，不实现专业 citation style 或文档导出。CLI 支持 SQLite 安全快照恢复；不能续接执行到一半的 HTTP/LLM 请求，也不支持多个进程同时恢复同一个 Run。并行批次内尚未返回主调度器的结果不构成安全 Checkpoint。
 
 ## Roadmap
@@ -640,7 +680,7 @@ python -m pytest -q
 | Phase 4 — Verifier Loop | Completed | 4A 批量证据支持验证、4B Gap Detection and Research Relevance、4C 预算内单轮补研究闭环。 |
 | Phase 5 — Writer + Citation | Completed | 5A Evidence-Grounded Writer 与发布前 grounding；5B 确定性引用、References、完整性校验及零模型调用。 |
 | Phase 6 — Persistence | Completed | SQLite JSON 快照、安全 Checkpoint、显式 Resume、阶段跳过、预算恢复与密钥排除。 |
-| Phase 7 — Evaluation | Planned | Benchmark、Quantitative Evaluation 与可重复的研究质量评测。 |
+| Phase 7 — Evaluation | Completed | 跨领域 Benchmark、确定性质量与效率指标、独立 Baseline、可选单次 Judge 及对比实验。 |
 | Phase 8 — UI + Docker + README | Planned | UI、Docker、Final Demo、Deployment、Project Packaging 与最终文档整理。 |
 
 ## Project Structure / 项目结构
@@ -648,12 +688,14 @@ python -m pytest -q
 ```text
 deepagent/
 ├── main.py                      # CLI 入口
+├── evaluate.py                  # 独立 Benchmark / Full vs Baseline 入口
 ├── demo_evidence.py             # Phase 3A 静态 Demo，无 LLM 或网络
 ├── pyproject.toml               # 依赖、安装与 pytest 配置
 ├── .env.example                 # 环境配置模板
 ├── app/
 │   ├── config.py                # Settings
 │   ├── llm.py                   # 模型创建
+│   ├── structured_output.py     # Qwen3.5 JSON Object 兼容与数据实例校验
 │   ├── persistence/
 │   │   ├── models.py            # ResearchRun / ResearchRunState / Checkpoint
 │   │   ├── store.py             # SQLite metadata、原子快照与查询
@@ -678,6 +720,8 @@ deepagent/
 │   │   ├── writer.md            # 合格 Claim 写作及可追溯结构
 │   │   └── report_grounding.md  # 表述与所引用 Claim 的支持检查
 │   ├── research/
+│   │   ├── page_quality.py       # 明显无效正文与验证/加载壳识别
+│   │   ├── writer_references.py  # C/P/G 分池与正式 ID 严格映射
 │   │   ├── orchestrator.py      # 批次式 DAG 调度
 │   │   ├── evidence_store.py    # 内存证据 Store 与 Bundle 合并
 │   │   ├── evidence_extraction.py # 结构化抽取与局部 Bundle 构建
@@ -716,6 +760,16 @@ deepagent/
 │   └── tools/
 │       ├── web_search.py        # Tavily 搜索
 │       └── fetch_webpage.py     # HTML 读取
+├── evaluation/                  # 外部只读评估，不修改研究决策
+│   ├── benchmarks/              # 当前 V2 学术/行业两例，保留历史 V1 八例
+│   ├── baselines/               # 独立 Search + Fetch + Summary
+│   ├── models.py                # Case / Evaluation / Comparison / Judge contracts
+│   ├── dataset.py               # 数据加载、校验和选择
+│   ├── runner.py                # 正常持久化入口、逐 Case 执行与失败隔离
+│   ├── metrics.py               # 确定性指标与结构性回归门
+│   ├── telemetry.py             # 本地模型/工具用量观测
+│   ├── judge.py                 # 可选、每报告最多一次的评估 Judge
+│   └── output.py                # 脱敏、聚合、JSONL/JSON/CSV
 ├── tests/                       # pytest 工程测试
 └── workspace/                   # 本地运行与诊断产物，除 .gitkeep 外不提交
 ```

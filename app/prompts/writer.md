@@ -21,13 +21,15 @@
 - conclusion：短段落列表，仅概括已有发现，每段保存 claim_ids。
 
 引用规则：
-- 每个事实段落必须引用至少一个输入 accepted_claims 中的真实 claim_id，不能创造 ID。
+- 每个事实段落必须引用至少一个输入 accepted_claims 中的 C 标签（如 C1），不能创造、改写或重编号。
+- P 标签只用于 limitations.partial_claim_ids；G 标签只用于 limitations.gap_ids。三类标签不能混用。
+- 标签与正式 ID 的映射由程序负责；只在引用字段输出标签，正文不得输出这些标签。
 - 在文字正文、标题和 scope 中不要输出任何内部 Claim/Evidence/Source/Gap/Task ID。
 - 不生成 citation number（如 [1]）、作者年份引用、参考文献、脚注、URL 或 bibliography。
 - 只在 Schema 的引用字段保存内部关联，引用格式将在后续阶段由程序处理。
 - 不提 RR 任务编号、GapGroup、工具调用、模型预算或内部 Agent 机制。
 
-长度及覆盖：材料充足时约 1200～2500 中文字，材料少时明显缩短，不能为凑长度添加事实。
+长度及覆盖：材料充足时约 1500～3500 中文字，材料少时明显缩短，不能为凑长度添加事实。
 尽量覆盖至少 60% 的不同 accepted Claims；可以合并重复结论，不必逐条照抄。
 只输出一个完整 JSON 对象；不写 Markdown 代码围栏，不另做 outline、搜索或修订轮次。
 

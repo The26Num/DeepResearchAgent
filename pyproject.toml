@@ -26,7 +26,10 @@ dependencies = [
 dev = ["pytest>=8,<10"]
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "evaluation*"]
+
+[tool.setuptools.package-data]
+evaluation = ["benchmarks/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

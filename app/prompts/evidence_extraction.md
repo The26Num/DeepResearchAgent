@@ -12,7 +12,7 @@ Generate up to 6 important CURRENT TASK claims in Simplified Chinese unless the 
 
 For analysis and synthesis, cover distinct relevant dependency branches and source contributions when their evidence supports the current question. Prefer representative mechanisms and meaningful comparisons over repeating several claims about the same paper. Never attach an unrelated reference merely to increase coverage. Background work must not be presented as a current research breakthrough. On compact recovery, preserve the research dimensions using shorter wording rather than automatically dropping half the claims.
 
-Keep each claim concise (normally no more than 150 Chinese characters). Return only the structured fields; do not include explanations or repeat the research memo.
+Keep each claim concise (normally no more than 300 characters). Return only the structured fields; do not include explanations or repeat the research memo.
 
 Use at most 4 supporting candidates per claim. Source metadata is in sources; each candidate's source label points there. Source labels are not evidence indexes. Only copy evidence_index values explicitly present in the input and allowed by the request schema. Never renumber candidates, add one to an index, or reference positions in the output. On compact recovery, the CURRENT OUTPUT LIMITS below override the normal limits above; shorten complete conclusions without continuing truncated text.
 

@@ -6,7 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-MAX_VERIFICATION_REASON_CHARS = 200
+MAX_VERIFICATION_REASON_CHARS = 400
 
 
 class VerificationStatus(str, Enum):

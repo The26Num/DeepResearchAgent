@@ -128,7 +128,8 @@ def validate_restored_state(state: ResearchRunState) -> None:
                 raise ValueError("Writer precedes the supplemental stage.")
             from app.agents.writer import validate_report
             if state.writing_context.accepted_claims:
-                validate_report(state.research_report, state.writing_context)
+                validate_report(state.research_report, state.writing_context,
+                    allow_insufficient=state.writer_usage.fallback_mode == "insufficient_material")
             elif state.research_report.factual_paragraphs():
                 raise ValueError("Zero accepted Claim report contains factual paragraphs.")
             for key in state.research_report.used_claim_ids:

@@ -25,7 +25,7 @@ class ResearchGap(BaseModel):
     gap_type: GapType
     task_id: str = Field(min_length=1)
     claim_id: str | None = Field(default=None, min_length=1)
-    description: str = Field(min_length=1, max_length=600)
+    description: str = Field(min_length=1, max_length=1000)
     missing_information: str = Field(min_length=1)
     status: GapStatus = GapStatus.OPEN
 

@@ -3,8 +3,8 @@
 from app.schemas.research_result import CompactResearchResult
 
 
-MAX_DEPENDENCY_CHARS = 2800
-MAX_TOTAL_CONTEXT_CHARS = 8000
+MAX_DEPENDENCY_CHARS = 4200
+MAX_TOTAL_CONTEXT_CHARS = 12000
 
 
 def _short(text: str, limit: int) -> str:
@@ -23,23 +23,23 @@ def _format_block(result: CompactResearchResult, limit: int) -> str:
 
     remaining = limit - len(lines[0]) - len("\nSummary: ")
     if remaining > 0:
-        add("Summary: " + _short(result.summary, min(450, remaining)))
+        add("Summary: " + _short(result.summary, min(700, remaining)))
 
     # Preserve the most useful findings and source URLs before secondary details.
     for finding in result.key_findings[:2]:
-        add("Finding: " + _short(finding, 320))
+        add("Finding: " + _short(finding, 500))
     for source in result.sources:
-        title_and_url = f"Source: {_short(source.title, 140)}\nURL: {source.url}"
+        title_and_url = f"Source: {_short(source.title, 240)}\nURL: {source.url}"
         if not add(title_and_url):
             continue  # Never truncate a URL.
         if source.year:
             add("Year: " + source.year)
         if source.key_point:
-            add("Key Point: " + _short(source.key_point, 180))
+            add("Key Point: " + _short(source.key_point, 300))
     for finding in result.key_findings[2:]:
-        add("Finding: " + _short(finding, 260))
+        add("Finding: " + _short(finding, 400))
     for uncertainty in result.uncertainties:
-        add("Uncertainty: " + _short(uncertainty, 160))
+        add("Uncertainty: " + _short(uncertainty, 260))
     return "\n".join(lines)
 
 

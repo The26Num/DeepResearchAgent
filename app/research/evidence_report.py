@@ -43,8 +43,8 @@ def finalize_evidence_report(
     entries = []
     for key, items in cited.items():
         source = sources[key]
-        excerpts = "\n".join(f"- 证据 {labels[item.evidence_id]}（摘录预览）：{item.content[:500]}"
-                             + ("…" if len(item.content) > 500 else "") for item in items)
+        excerpts = "\n".join(f"- 证据 {labels[item.evidence_id]}（摘录预览）：{item.content[:800]}"
+                             + ("…" if len(item.content) > 800 else "") for item in items)
         entries.append(f"### {' '.join(source.title.split())}\n- URL：{source.url}\n"
                        f"- 日期：{' '.join((source.published_at or '未知').split())}\n{excerpts}")
     source_text = "\n\n".join(entries) or "暂无用于支持本任务结论的来源。"
@@ -54,9 +54,9 @@ def finalize_evidence_report(
     compact = compact_from_memo(task.id, result)
     points = {sources[key].url: items[0].content for key, items in cited.items()}
     for source in compact.sources:
-        source.key_point = points[source.url][:240]
+        source.key_point = points[source.url][:400]
     # The compact channel carries conclusions, never rendering-only ID lines.
-    compact.key_findings = [" ".join(claim.text.split())[:360] for claim in bundle.claims[:6]]
+    compact.key_findings = [" ".join(claim.text.split())[:600] for claim in bundle.claims[:6]]
     if not bundle.claims:
         compact.key_findings = []
         compact.sources = []

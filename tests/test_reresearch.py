@@ -104,7 +104,7 @@ def test_batch_planner_two_groups_one_call_origins_compact_context_no_internal_i
     assert payload["research_goal"] == "Full original goal"
     assert len(payload["groups"]) == 2
     assert all(key not in model.requests[0][0][1].text for key in [gaps[0].gap_id, "evidence_ids", "memo", "sources"])
-    assert model.requests[0][1]["max_tokens"] == 2048
+    assert model.requests[0][1]["max_tokens"] == 3072
     assert model.requests[0][1]["timeout"] <= 60
     assert len(original.tasks) == 2
 
@@ -401,7 +401,7 @@ def test_planner_http_native_fallback_both_counted_and_limits_forwarded():
                 select_gap_groups([gap()], settings()), [])
     assert len(result.tasks) == 1 and budget.calls == 2
     assert len(requests) == 2
-    assert all(body["max_completion_tokens"] == 2048 and not body.get("tools") for body in requests)
+    assert all(body["max_completion_tokens"] == 3072 and not body.get("tools") for body in requests)
 
 
 def test_reresearch_prompt_does_not_hardcode_topic_or_force_proof():

@@ -9,6 +9,7 @@ from openai import BadRequestError
 from pydantic import ValidationError
 
 from app.schemas.plan import ResearchPlan, validate_plan_dependencies
+from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 
 
 _PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "supervisor.md"
@@ -45,6 +46,13 @@ class Supervisor:
             "不要机械地为每个 discovery 各添加一个 analysis 或 synthesis，导致超出任务预算。"
         )
         messages = [SystemMessage(content=self.system_prompt), HumanMessage(content=dated_query)]
+        if prefers_json_object(self.model):
+            request = [SystemMessage(content=self.system_prompt + json_instance_instructions(ResearchPlan.model_json_schema())),
+                       messages[1]]
+            response = self.model.invoke(request, **json_object_options(self.model))
+            plan = ResearchPlan.model_validate(parse_json_instance(response.text))
+            self._validate_plan(plan)
+            return plan
         try:
             structured = self.model.with_structured_output(ResearchPlan, method="json_schema")
             plan = ResearchPlan.model_validate(structured.invoke(messages))
@@ -54,14 +62,11 @@ class Supervisor:
             # Some OpenAI-compatible models reject response_format=json_schema.
             try:
                 fallback_messages = [
-                    SystemMessage(content=self.system_prompt + "\nReturn only a JSON object matching this schema:\n" + json.dumps(ResearchPlan.model_json_schema(), ensure_ascii=False)),
+                    SystemMessage(content=self.system_prompt + json_instance_instructions(ResearchPlan.model_json_schema())),
                     HumanMessage(content=dated_query),
                 ]
                 response = self.model.invoke(fallback_messages)
-                raw = response.text.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                plan = ResearchPlan.model_validate_json(raw)
+                plan = ResearchPlan.model_validate(parse_json_instance(response.text))
                 self._validate_plan(plan)
                 return plan
             except (ValueError, ValidationError, json.JSONDecodeError, IndexError, AttributeError) as parse_error:

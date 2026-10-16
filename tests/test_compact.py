@@ -41,7 +41,7 @@ def test_long_memo_is_compressed_without_raw_page_text() -> None:
     ) + "\n## Important Sources\n### Paper\n- URL: https://example.org/paper\n- Key Point: Short.\n"
     result = compact_from_memo("task1", memo)
     assert len(result.model_dump_json()) <= MAX_COMPACT_CHARS
-    assert len(result.key_findings) <= 6
+    assert len(result.key_findings) <= 8
     assert result.sources[0].url == "https://example.org/paper"
 
 

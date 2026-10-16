@@ -67,7 +67,7 @@ class ToolBudget:
                 return
             normalize_source_url(url)
             reading = {"url": url, "title": str(page.get("title") or ""),
-                       "published_at": str(page.get("published_at") or ""), "text": text[:8000]}
+                       "published_at": str(page.get("published_at") or ""), "text": text[:12000]}
             with self.lock:
                 if reading not in self.readings:
                     self.readings.append(reading)
@@ -146,7 +146,7 @@ def budgeted_tools(
         return with_remaining(raw, "web_search", used, maximum)
 
     @tool("fetch_webpage")
-    def limited_fetch(url: str, max_chars: int = 5000) -> str:
+    def limited_fetch(url: str, max_chars: int = 7500) -> str:
         """Read one important HTML source page, within this task's fetch budget."""
         if budget.runtime:
             budget.runtime.remaining()

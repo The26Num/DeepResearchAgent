@@ -9,18 +9,23 @@ from urllib.parse import urlsplit
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from openai import APITimeoutError, BadRequestError, LengthFinishReasonError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import get_settings
+from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 from app.research.evidence_context import EvidenceContext
 from app.research.runtime import ResearchModelCallbacks, ResearchRuntime
 from app.schemas import Claim, Evidence, Source, TaskEvidenceBundle, ResearchTask
-from app.schemas.evidence_extraction import ExtractedEvidenceResult
+from app.schemas.evidence_extraction import EvidenceIndex, ExtractedClaim, ExtractedEvidenceResult
+from app.schemas.evidence import MAX_EVIDENCE_CHARS
 from app.schemas.source import classify_source_url, normalize_source_url
 
 
 _PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "evidence_extraction.md"
-MAX_EXTRACTION_INPUT_CHARS = 48000
+MAX_EXTRACTION_INPUT_CHARS = 72000
 MAX_NEW_EVIDENCE = 12
+MAX_EXTRACTION_CLAIM_CHARS = 300
+MAX_COMPACT_EXTRACTION_CLAIM_CHARS = 180
 
 
 class EvidenceExtractionTimeoutError(TimeoutError):
@@ -35,6 +40,31 @@ class _TruncatedOutput(Exception):
     """A plain-JSON compatibility response ended with finish_reason=length."""
 
 
+class _ExtractionEnvelope(BaseModel):
+    """Validate the container before validating each proposed Claim separately."""
+    model_config = ConfigDict(extra="forbid")
+    selected_evidence_indexes: list[EvidenceIndex] = Field(default_factory=list, max_length=12)
+    claims: list[object] = Field(default_factory=list, max_length=8)
+
+
+def validate_extraction_rows(result, report=None) -> ExtractedEvidenceResult:
+    if isinstance(result, ExtractedEvidenceResult):
+        return result
+    envelope = _ExtractionEnvelope.model_validate(result)
+    claims = []
+    for index, row in enumerate(envelope.claims):
+        try:
+            claims.append(ExtractedClaim.model_validate(row))
+        except ValidationError as error:
+            issues = ";".join(".".join(map(str, item["loc"])) + ":" + item["type"]
+                              for item in error.errors(include_input=False, include_url=False))[:300]
+            if report:
+                report(f"evidence claim omitted: row={index} reason={issues}; no formal Claim created")
+    if envelope.claims and not claims and report:
+        report("evidence coverage gap: all proposed Claims failed validation; no factual findings published")
+    return ExtractedEvidenceResult(selected_evidence_indexes=envelope.selected_evidence_indexes, claims=claims)
+
+
 def extraction_output_schema(candidate_count: int, *, compact: bool = False) -> dict:
     """Constrain this request's reference choices and output size at the provider."""
     schema = deepcopy(ExtractedEvidenceResult.model_json_schema())
@@ -43,7 +73,7 @@ def extraction_output_schema(candidate_count: int, *, compact: bool = False) -> 
     claim = schema["$defs"]["ExtractedClaim"]["properties"]
     claim["supporting_evidence_indexes"]["items"]["enum"] = valid
     claim["supporting_evidence_indexes"]["maxItems"] = 3 if compact else 4
-    claim["text"]["maxLength"] = 90 if compact else 160
+    claim["text"]["maxLength"] = MAX_COMPACT_EXTRACTION_CLAIM_CHARS if compact else MAX_EXTRACTION_CLAIM_CHARS
     schema["properties"]["claims"]["maxItems"] = 6
     if compact:
         schema["properties"]["selected_evidence_indexes"]["maxItems"] = 6
@@ -69,7 +99,7 @@ def source_fragments(text: str) -> list[dict]:
             while end > start and text[end - 1].isspace():
                 end -= 1
             content = text[start:end]
-            if 0 < len(content) <= 2000 and content != text:
+            if 0 < len(content) <= MAX_EVIDENCE_CHARS and content != text:
                 fragments.append({"content": content, "start": start, "end": end})
     return fragments
 
@@ -116,13 +146,13 @@ def prepare_extraction_payload(task: ResearchTask, memo: str, readings: list[dic
             continue
         key = normalize_source_url(reading["url"])
         if key not in pages:
-            pages[key] = {"url": reading["url"], "title": str(reading.get("title") or reading["url"])[:300],
+            pages[key] = {"url": reading["url"], "title": str(reading.get("title") or reading["url"])[:500],
                           "published_at": str(reading.get("published_at") or "") or None,
-                          "text": re.sub(r"\s+", " ", reading["text"]).strip()[:5000]}
+                          "text": re.sub(r"\s+", " ", reading["text"]).strip()[:7500]}
         elif len(reading["text"]) > len(pages[key]["text"]):
-            pages[key]["text"] = re.sub(r"\s+", " ", reading["text"]).strip()[:5000]
+            pages[key]["text"] = re.sub(r"\s+", " ", reading["text"]).strip()[:7500]
     payload = {"task": {"task_id": task.id, "task_type": task.task_type, "question": task.question, "title": task.title},
-               "memo": memo[:4000], "fetched_pages": list(pages.values())}
+               "memo": memo[:6000], "fetched_pages": list(pages.values())}
     while True:
         payload["candidates"], payload["upstream_claims"] = _candidates(payload["fetched_pages"], upstream)
         # Include both dynamic enums and compatibility/recovery instructions in
@@ -174,11 +204,12 @@ class EvidenceExtractor:
             else:
                 options["max_tokens"] = max_tokens
             model_name = str(getattr(self.model, "model_name", ""))
-            if host and host.endswith(".aliyuncs.com") and model_name.startswith("qwen3.7-"):
+            if host and host.endswith(".aliyuncs.com") and model_name.lower().startswith(("qwen3", "qwen-plus", "qwen-flash")):
                 # Override extraction only; the shared research model keeps its
                 # original thinking configuration and request timeout.
                 options["extra_body"] = {**(getattr(self.model, "extra_body", None) or {}),
                                          "enable_thinking": settings.evidence_extraction_enable_thinking}
+            options.update(json_object_options(self.model))
             try:
                 result = model.invoke(request, config=config, **options)
             except APITimeoutError as error:
@@ -191,15 +222,17 @@ class EvidenceExtractor:
             runtime.remaining()
             return result
 
-        use_native = True
+        use_native = not prefers_json_object(self.model)
+        if not use_native:
+            runtime.log("evidence output mode=json_object; thinking disabled")
 
         def extract_once(*, compact=False):
             nonlocal use_native
             schema = extraction_output_schema(len(payload["candidates"]), compact=compact)
-            instructions = ("\nCURRENT OUTPUT LIMITS: at most 6 claims, each <=90 characters, each <=3 references; "
+            instructions = (f"\nCURRENT OUTPUT LIMITS: at most 6 claims, each <={MAX_COMPACT_EXTRACTION_CLAIM_CHARS} characters, each <=3 references; "
                             "at most 6 standalone selections. Return one short complete JSON object."
                             if compact else
-                            "\nCURRENT OUTPUT LIMITS: at most 6 claims, each <=160 characters, each <=4 references.")
+                            f"\nCURRENT OUTPUT LIMITS: at most 6 claims, each <={MAX_EXTRACTION_CLAIM_CHARS} characters, each <=4 references.")
             prompt = self.prompt + instructions
             max_tokens = (min(8192, max(1024, settings.evidence_extraction_max_tokens * 2))
                           if compact else settings.evidence_extraction_max_tokens)
@@ -215,15 +248,11 @@ class EvidenceExtractor:
                     runtime.remaining()
                     use_native = False
                     runtime.log("native evidence JSON Schema unavailable; using schema-validated JSON")
-            fallback = [SystemMessage(content=prompt + "\nReturn only JSON matching this schema:\n"
-                                      + json.dumps(schema, ensure_ascii=False)), data_message]
+            fallback = [SystemMessage(content=prompt + json_instance_instructions(schema)), data_message]
             response = invoke(self.model, fallback, max_tokens)
             if response.response_metadata.get("finish_reason") == "length":
                 raise _TruncatedOutput()
-            raw = response.text.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            return json.loads(raw)
+            return parse_json_instance(response.text)
 
         try:
             result = extract_once()
@@ -237,7 +266,7 @@ class EvidenceExtractor:
                     f"Evidence extraction output remained truncated for task {runtime.task_id} after one compact recovery attempt. "
                     "No incomplete JSON or evidence bundle was published."
                 ) from error
-        return filter_candidate_references(ExtractedEvidenceResult.model_validate(result), payload, runtime.log)
+        return filter_candidate_references(validate_extraction_rows(result, runtime.log), payload, runtime.log)
 
 
 def filter_candidate_references(extracted: ExtractedEvidenceResult, payload: dict,

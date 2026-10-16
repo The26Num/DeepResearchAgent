@@ -8,13 +8,18 @@ from pathlib import Path
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 from openai import BadRequestError, LengthFinishReasonError
+from pydantic import ValidationError
 
 from app.config import Settings, get_settings
 from app.llm import bounded_output_options, create_writer_llm
+from app.structured_output import (SchemaEchoError, json_instance_instructions, json_object_options,
+                                   parse_json_instance, prefers_json_object)
 from app.research.runtime import ResearchRuntime
 from app.research.writing_context import WritingContext
-from app.schemas.report import ResearchReport, ReportLimitation
-from app.agents.report_grounding import ReportGroundingChecker, ReportGroundingUsage
+from app.research.writer_references import WriterReferenceError, WriterReferences
+from app.schemas.report import (MAX_REPORT_PARAGRAPH_CHARS, MAX_REPORT_SCOPE_CHARS,
+                                MAX_REPORT_TITLE_CHARS, ResearchReport, ReportLimitation)
+from app.agents.report_grounding import ReportGroundingAudit, ReportGroundingChecker, ReportGroundingUsage
 
 
 class WriterOutputError(ValueError):
@@ -33,14 +38,21 @@ class WriterUsage:
     output_tokens: int = 0
     usage_responses: int = 0
     grounding: ReportGroundingUsage = field(default_factory=ReportGroundingUsage)
+    format_retries: int = 0
+    fallback_mode: str = ""
+    fallback_reason: str = ""
+    omitted_claim_ids: list[str] = field(default_factory=list)
 
 
-def validate_report(report: ResearchReport, context: WritingContext) -> None:
+def validate_report(report: ResearchReport, context: WritingContext, *, allow_insufficient=False) -> None:
     payload = context.payload
     allowed = {item.claim_id for item in context.accepted_claims}
     gaps = {item["gap_id"] for item in payload["open_gaps"]}
     partial = {item["claim_id"] for item in payload["partial_claims_for_limitations_only"]}
-    if not report.key_findings or not report.executive_summary or not report.sections or not report.conclusion:
+    populated = [report.key_findings, report.executive_summary, report.sections, report.conclusion]
+    if allow_insufficient and any(populated):
+        raise WriterOutputError("An insufficient-material fallback cannot contain factual paragraphs.")
+    if not all(populated) and not (allow_insufficient and not any(populated)):
         raise WriterOutputError("Writer must populate summary, findings, analysis and conclusion from accepted Claims.")
     for item in report.factual_paragraphs():
         if not set(item.claim_ids) <= allowed:
@@ -89,10 +101,20 @@ class ResearchWriter:
             runtime = ResearchRuntime("Writer", self.settings.writer_timeout_seconds,
                                       self.settings.research_progress_interval_seconds)
             report = runtime.run(lambda: self._write(context, runtime, usage))
-            report = self.grounding_checker.check(report, context)
-            usage.grounding = self.grounding_checker.last_usage
-            self.last_grounding = self.grounding_checker.last_audit
-            validate_report(report, context)
+            if not usage.fallback_mode:
+                try:
+                    report = self.grounding_checker.check(report, context)
+                    validate_report(report, context)
+                except ValueError as error:
+                    report = self._conservative_report(context, usage, "Grounding output rejected: " + str(error)[:400])
+                usage.grounding = self.grounding_checker.last_usage
+                self.last_grounding = self.grounding_checker.last_audit
+            if usage.fallback_mode:
+                # Program-selected literal Claims have no newly generated prose.
+                # Record this audit explicitly; do not spend another judge call.
+                self.last_grounding = self._literal_audit(report)
+                usage.grounding.checked_items += len(self.last_grounding)
+            validate_report(report, context, allow_insufficient=usage.fallback_mode == "insufficient_material")
         usage.used_claims = len(report.used_claim_ids)
         usage.unused_claims = usage.accepted_claims - usage.used_claims
         usage.coverage = usage.used_claims / usage.accepted_claims if usage.accepted_claims else 0.0
@@ -100,7 +122,8 @@ class ResearchWriter:
               f"coverage={usage.coverage:.2f} calls={usage.llm_calls}", flush=True)
         print(f"Writer Summary: accepted_claims={usage.accepted_claims} used_claims={usage.used_claims} "
               f"unused_claims={usage.unused_claims} coverage={usage.coverage:.2f} "
-              f"context_chars={usage.context_chars} calls={usage.llm_calls}", flush=True)
+              f"context_chars={usage.context_chars} calls={usage.llm_calls} "
+              f"format_retries={usage.format_retries} fallback={usage.fallback_mode or 'none'}", flush=True)
         if usage.usage_responses:
             print(f"Writer token usage: input_tokens={usage.input_tokens} output_tokens={usage.output_tokens} "
                   f"usage_responses={usage.usage_responses}/{usage.llm_calls}", flush=True)
@@ -118,38 +141,42 @@ class ResearchWriter:
         limitations += [ReportLimitation(text="当前证据或目标覆盖不足，以下内容不能作为确定性结论：" + item["text"],
                                          partial_claim_ids=[item["claim_id"]])
                         for item in payload["partial_claims_for_limitations_only"]]
-        if len(limitations) > 20:
+        if len(limitations) > 30:
             # Consolidate without losing gap/partial reference IDs.
             limitations = []
-            for offset in range(0, len(payload["open_gaps"]), 30):
-                batch = payload["open_gaps"][offset:offset + 30]
+            for offset in range(0, len(payload["open_gaps"]), 45):
+                batch = payload["open_gaps"][offset:offset + 45]
                 limitations.append(ReportLimitation(text="当前材料仍有未解决或仅部分改善的研究缺口，包括："
                     + batch[0]["missing_information"], gap_ids=[item["gap_id"] for item in batch]))
-            for offset in range(0, len(payload["partial_claims_for_limitations_only"]), 20):
-                batch = payload["partial_claims_for_limitations_only"][offset:offset + 20]
+            for offset in range(0, len(payload["partial_claims_for_limitations_only"]), 30):
+                batch = payload["partial_claims_for_limitations_only"][offset:offset + 30]
                 limitations.append(ReportLimitation(text="部分结论的证据或目标覆盖仍不充分，不能作为确定事实，包括："
                     + batch[0]["text"], partial_claim_ids=[item["claim_id"] for item in batch]))
-        return ResearchReport(title=("研究报告：" + context.goal)[:180], scope=context.goal[:1200],
+        return ResearchReport(title=("研究报告：" + context.goal)[:MAX_REPORT_TITLE_CHARS],
+            scope=context.goal[:MAX_REPORT_SCOPE_CHARS],
             executive_summary=[], key_findings=[], sections=[], limitations=limitations, conclusion=[])
 
     def _write(self, context, runtime, usage):
         if self.model is None:
             self.model = create_writer_llm()
         schema = ResearchReport.model_json_schema()
-        allowed = [item.claim_id for item in context.accepted_claims]
+        refs = WriterReferences.build(context)
+        allowed = list(refs.claims)
         payload = context.payload
         for name in ("ReportParagraph", "Finding"):
             schema["$defs"][name]["properties"]["claim_ids"]["items"]["enum"] = allowed
         for field in ("executive_summary", "key_findings", "sections", "conclusion"):
             schema["properties"][field]["minItems"] = 1
-        for field, refs in (("gap_ids", [item["gap_id"] for item in payload["open_gaps"]]),
-                            ("partial_claim_ids", [item["claim_id"] for item in payload["partial_claims_for_limitations_only"]])):
+        for field, labels in (("gap_ids", list(refs.gaps)), ("partial_claim_ids", list(refs.partial))):
             prop = schema["$defs"]["ReportLimitation"]["properties"][field]
-            if refs:
-                prop["items"]["enum"] = refs
+            if labels:
+                prop["items"]["enum"] = labels
             else:
                 prop["maxItems"] = 0
-        messages = [SystemMessage(content=self.prompt), HumanMessage(content=context.text)]
+        contract = ("\nReference fields use batch-local labels only: claim_ids use C labels from accepted_claims; "
+                    "partial_claim_ids use P labels only in limitations; gap_ids use G labels only in limitations. "
+                    "Never output canonical IDs or copy these labels into prose.\n")
+        messages = [SystemMessage(content=self.prompt + contract), HumanMessage(content=refs.text)]
 
         def invoke(model, request):
             captured = []
@@ -161,6 +188,7 @@ class ResearchWriter:
                             captured.append(getattr(generations[0], "message", None))
 
             options = bounded_output_options(self.model, self.settings.max_report_output_tokens)
+            options.update(json_object_options(self.model))
             options["timeout"] = min(self.settings.model_request_timeout_seconds, runtime.remaining())
             usage.llm_calls += 1
             try:
@@ -181,31 +209,46 @@ class ResearchWriter:
                 raise WriterOutputError("Writer output was truncated; no incomplete report published.")
             return response
 
-        response = None
-        if self._native_available:
+        correction = ""
+        for attempt in range(2):
+            runtime.log(f"writer attempt={attempt + 1}/2 accepted_claims={len(allowed)}")
             try:
-                structured = self.model.with_structured_output(schema, method="json_schema")
-                response = invoke(structured, messages)
+                request = [SystemMessage(content=messages[0].content + correction), messages[1]]
+                response = None
+                if self._native_available and not prefers_json_object(self.model):
+                    try:
+                        response = invoke(self.model.with_structured_output(schema, method="json_schema"), request)
+                        if response is None:
+                            raise WriterOutputError("Writer returned no structured report.")
+                    except (NotImplementedError, TypeError, BadRequestError) as error:
+                        if isinstance(error, BadRequestError) and not any(
+                            term in str(error).lower() for term in ("json_schema", "response_format")):
+                            raise
+                        runtime.remaining()
+                        self._native_available = False
                 if response is None:
-                    raise WriterOutputError("Writer returned no structured report.")
-            except (NotImplementedError, TypeError, BadRequestError) as error:
-                if isinstance(error, BadRequestError) and not any(
-                    term in str(error).lower() for term in ("json_schema", "response_format")
-                ):
-                    raise
-                runtime.remaining()
-                self._native_available = False
-        if response is None:
-            fallback = [SystemMessage(content=self.prompt + "\nReturn only JSON matching:\n"
-                                      + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))), messages[1]]
-            raw = invoke(self.model, fallback)
-            text = raw.text.strip()
-            if text.startswith("```") and text.endswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            report = ResearchReport.model_validate_json(text)
-        else:
-            report = ResearchReport.model_validate(response)
-        validate_report(report, context)
+                    if prefers_json_object(self.model):
+                        runtime.log("writer output mode=json_object; thinking disabled")
+                    request[0] = SystemMessage(content=request[0].content + json_instance_instructions(schema))
+                    raw = invoke(self.model, request)
+                    response = parse_json_instance(raw.text)
+                report = refs.decode(ResearchReport.model_validate(response))
+                validate_report(report, context)
+                break
+            except (WriterOutputError, WriterReferenceError, SchemaEchoError, ValidationError, json.JSONDecodeError) as error:
+                if isinstance(error, ValidationError):
+                    reason = "; ".join(".".join(map(str, item["loc"])) + ":" + item["type"]
+                                       for item in error.errors(include_input=False, include_url=False)[:6])
+                else:
+                    reason = str(error)
+                reason = reason[:600]
+                runtime.log(f"writer output rejected attempt={attempt + 1}/2: {reason}")
+                if attempt:
+                    return self._conservative_report(context, usage, reason)
+                usage.format_retries += 1
+                correction = ("\nFORMAT CORRECTION: " + reason
+                              + ". Regenerate one complete report using the same accepted facts and label whitelists. "
+                                "Omit facts not supported by accepted Claims; no new research.\n")
         if not report.limitations and (payload["open_gaps"] or payload["partial_claims_for_limitations_only"]):
             # Small compatible models can omit limitations despite valid facts.
             # Keep current gaps visible without inventing facts or another call.
@@ -229,4 +272,50 @@ class ResearchWriter:
             report = ResearchReport.model_validate({**report.model_dump(), "limitations": limitations})
             validate_report(report, context)
             runtime.log("model omitted limitations; retained current gap/partial summaries without another model call")
+        return report
+
+    @staticmethod
+    def _literal_audit(report):
+        rows = []
+        for field in ("executive_summary", "key_findings", "conclusion"):
+            rows.extend((f"{field}.{index}", item) for index, item in enumerate(getattr(report, field)))
+        rows.extend((f"sections.{index}.paragraphs.{offset}", item)
+                    for index, section in enumerate(report.sections) for offset, item in enumerate(section.paragraphs))
+        return tuple(ReportGroundingAudit(path, "SUPPORTED", "Program fallback: verbatim accepted Claim, no generated facts.",
+            False, item.text, item.text, tuple(item.claim_ids)) for path, item in rows)
+
+    def _conservative_report(self, context, usage, reason):
+        """Discard the rejected draft entirely; never repair IDs on its prose."""
+        facts = []
+        for claim in context.accepted_claims:
+            if len(claim.text) > MAX_REPORT_PARAGRAPH_CHARS or len(facts) == 48:
+                usage.omitted_claim_ids.append(claim.claim_id)
+                continue
+            item = {"text": claim.text, "claim_ids": [claim.claim_id]}
+            probe = ResearchReport(title="研究报告", scope="仅展示已接受的结论。", executive_summary=[item],
+                key_findings=[item], sections=[{"heading": "研究发现", "paragraphs": [item]}], conclusion=[item], limitations=[])
+            try:
+                validate_report(probe, context)
+            except WriterOutputError:
+                usage.omitted_claim_ids.append(claim.claim_id)
+                continue
+            facts.append(item)
+        limitations = []
+        for offset in range(0, len(context.payload["open_gaps"]), 45):
+            batch = context.payload["open_gaps"][offset:offset + 45]
+            limitations.append({"text": "当前收集材料仍存在未解决或仅部分改善的研究缺口。",
+                                "gap_ids": [item["gap_id"] for item in batch], "partial_claim_ids": []})
+        partial = context.payload["partial_claims_for_limitations_only"]
+        for offset in range(0, len(partial), 30):
+            limitations.append({"text": "部分结论的证据支持或目标覆盖不足，未作为确定性发现。", "gap_ids": [],
+                                "partial_claim_ids": [item["claim_id"] for item in partial[offset:offset + 30]]})
+        report = ResearchReport(title="研究报告", scope="本报告仅复述当前证据充分且与研究目标对齐的已接受结论，并保留材料缺口。",
+            executive_summary=facts[:1], key_findings=facts[:15],
+            sections=[{"heading": "研究发现", "paragraphs": facts[index:index + 6]} for index in range(0, len(facts), 6)],
+            conclusion=facts[-1:], limitations=limitations[:30])
+        usage.fallback_mode = "verbatim_claims" if facts else "insufficient_material"
+        usage.fallback_reason = reason
+        validate_report(report, context, allow_insufficient=not facts)
+        print(f"[Writer] deterministic fallback: mode={usage.fallback_mode} used_claims={len(facts)} "
+              f"omitted_claims={len(usage.omitted_claim_ids)} model_calls=0", flush=True)
         return report

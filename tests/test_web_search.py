@@ -73,7 +73,7 @@ def test_hard_cap_and_snippet_limit(monkeypatch) -> None:
     monkeypatch.setattr(search_module.requests, "post", post)
     result = search("topic", max_results=50000)
     assert len(result["results"]) == 8
-    assert all(len(item["snippet"]) == 500 for item in result["results"])
+    assert all(len(item["snippet"]) == 800 for item in result["results"])
 
 
 @pytest.mark.parametrize("key", [None, "", "  ", "replace-with-your-api-key"])

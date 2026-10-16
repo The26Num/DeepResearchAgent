@@ -234,7 +234,7 @@ def test_missing_duplicate_and_unknown_output_ids_fail_closed(mutate):
 
 
 @pytest.mark.parametrize("patch", [
-    {"status": "TRUE"}, {"status": "UNKNOWN"}, {"confidence": 0.8}, {"reason": "x" * 201}, {"reason": " "},
+    {"status": "TRUE"}, {"status": "UNKNOWN"}, {"confidence": 0.8}, {"reason": "x" * 401}, {"reason": " "},
     {"evidence_ids": ["model-invented-id"]}, {"gap": "Search again"},
 ])
 def test_invalid_status_long_reason_and_extra_fields_rejected(patch):
@@ -305,7 +305,7 @@ def test_real_http_transport_native_fallback_usage_no_tools_and_output_budget(na
     for request, body in requests:
         assert "tools" not in body and "tool_choice" not in body
         assert body["keep"] == "original"
-        assert body["max_tokens" if "siliconflow" in base_url else "max_completion_tokens"] == 2048
+        assert body["max_tokens" if "siliconflow" in base_url else "max_completion_tokens"] == 3072
         assert 0 < request.extensions["timeout"]["read"] <= 60
 
 

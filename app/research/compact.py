@@ -5,7 +5,7 @@ import re
 from app.schemas.research_result import CompactResearchResult, SourceSummary
 
 
-MAX_COMPACT_CHARS = 3000
+MAX_COMPACT_CHARS = 4500
 _HEADING = re.compile(r"(?m)^##\s+(.+?)\s*$")
 _SOURCE_HEADING = re.compile(r"(?m)^###\s+(.+?)\s*$")
 _URL = re.compile(r"https?://[^\s)>\]]+")
@@ -50,8 +50,8 @@ def compact_from_memo(task_id: str, memo: str) -> CompactResearchResult:
         line = re.sub(r"^(?:[-*]\s+|\d+[.)]\s*)", "", line).replace("**", "")
         finding = f"{current_heading}: {line}" if current_heading else line
         if finding and finding not in findings:
-            findings.append(_clip(finding, 360))
-        if len(findings) >= 6:
+            findings.append(_clip(finding, 600))
+        if len(findings) >= 8:
             break
 
     source_section = sections.get("重要来源", sections.get("Important Sources", ""))
@@ -66,7 +66,7 @@ def compact_from_memo(task_id: str, memo: str) -> CompactResearchResult:
         if not url_match:
             continue
         url = url_match.group()
-        if url in seen_urls or len(url) > 1000:
+        if url in seen_urls or len(url) > 2000:
             continue
         seen_urls.add(url)
         title = re.sub(r"^#+\s*", "", heading.group(1)).strip()
@@ -74,23 +74,23 @@ def compact_from_memo(task_id: str, memo: str) -> CompactResearchResult:
         year = _field(block, "年份", "日期", "Year", "Date")
         point = _field(block, "关键点", "关键摘录", "Key Point", "Key Extract")
         sources.append(SourceSummary(
-            title=_clip(title or url, 180),
+            title=_clip(title or url, 300),
             url=url,
-            year=_clip(year, 32) if year and year.casefold() not in {"unknown", "未知"} else None,
-            key_point=_clip(point, 240) if point else None,
+            year=_clip(year, 64) if year and year.casefold() not in {"unknown", "未知"} else None,
+            key_point=_clip(point, 400) if point else None,
         ))
-        if len(sources) >= 6:
+        if len(sources) >= 8:
             break
 
     uncertainties: list[str] = []
     for line in sections.get("不确定性与缺失信息", sections.get("Uncertainties / Missing Information", "")).splitlines():
         line = re.sub(r"^\s*(?:[-*]\s+|\d+[.)]\s*)", "", line).replace("**", "").strip()
         if line:
-            uncertainties.append(_clip(line, 180))
-        if len(uncertainties) >= 4:
+            uncertainties.append(_clip(line, 300))
+        if len(uncertainties) >= 6:
             break
 
-    summary = _clip(findings[0] if findings else sections.get("研究任务", sections.get("Research Task", "")), 420)
+    summary = _clip(findings[0] if findings else sections.get("研究任务", sections.get("Research Task", "")), 700)
     compact = CompactResearchResult(
         task_id=task_id, summary=summary, key_findings=findings,
         sources=sources, uncertainties=uncertainties,

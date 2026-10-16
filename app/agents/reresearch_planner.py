@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import Settings, get_settings
 from app.llm import bounded_output_options, create_verifier_llm
+from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 from app.research.reresearch import GapGroup
 from app.research.runtime import ResearchRuntime
 from app.schemas.claim import Claim
@@ -19,8 +20,8 @@ from app.schemas.reresearch import ReResearchPlan, ReResearchTask
 class _TaskDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     group_id: str
-    title: str = Field(min_length=1, max_length=180)
-    description: str = Field(min_length=1, max_length=900)
+    title: str = Field(min_length=1, max_length=300)
+    description: str = Field(min_length=1, max_length=1500)
 
 
 class _BatchDraft(BaseModel):
@@ -54,8 +55,8 @@ class ReResearchPlanner:
                 "group_id": group.group_id,
                 "original_task": {"title": task.title, "description": task.description},
                 "gap_types": [item.value for item in group.gap_types],
-                "missing_information": [text[:450] for text in group.missing_information],
-                "related_claim_texts": [related[key].text[:350] for key in group.claim_ids[:3] if key in related],
+                "missing_information": [text[:700] for text in group.missing_information],
+                "related_claim_texts": [related[key].text[:550] for key in group.claim_ids[:3] if key in related],
             })
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if len(data) > self.settings.max_reresearch_planning_context_chars:
@@ -73,6 +74,7 @@ class ReResearchPlanner:
 
             def invoke(model, request):
                 options = bounded_output_options(self.model, self.settings.reresearch_planning_max_tokens)
+                options.update(json_object_options(self.model))
                 options["timeout"] = min(self.settings.model_request_timeout_seconds, runtime.remaining())
                 if runtime.call_budget is not None:
                     runtime.call_budget.reserve("planner")
@@ -82,7 +84,7 @@ class ReResearchPlanner:
                 return response
 
             response = None
-            if self._native_available:
+            if self._native_available and not prefers_json_object(self.model):
                 try:
                     structured = self.model.with_structured_output(schema, method="json_schema")
                     response = invoke(structured, messages)
@@ -96,13 +98,11 @@ class ReResearchPlanner:
                     runtime.remaining()
                     self._native_available = False
             if response is None:
-                request = [SystemMessage(content=self.prompt + "\nReturn only JSON matching:\n"
-                                          + json.dumps(schema, ensure_ascii=False)), messages[1]]
+                if prefers_json_object(self.model):
+                    runtime.log("planner output mode=json_object; thinking disabled")
+                request = [SystemMessage(content=self.prompt + json_instance_instructions(schema)), messages[1]]
                 raw = invoke(self.model, request)
-                text = raw.text.strip()
-                if text.startswith("```") and text.endswith("```"):
-                    text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                result = _BatchDraft.model_validate_json(text)
+                result = _BatchDraft.model_validate(parse_json_instance(raw.text))
             else:
                 result = _BatchDraft.model_validate(response)
             drafts = {item.group_id: item for item in result.results}

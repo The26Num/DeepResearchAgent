@@ -6,7 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 
-MAX_RELEVANCE_REASON_CHARS = 160
+MAX_RELEVANCE_REASON_CHARS = 320
 
 
 class RelevanceStatus(str, Enum):

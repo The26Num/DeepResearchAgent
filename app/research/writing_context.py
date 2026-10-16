@@ -70,7 +70,7 @@ class WritingContextBuilder:
             if verified.status == VerificationStatus.UNSUPPORTED or relevant.status == RelevanceStatus.MISALIGNED:
                 continue
             if verified.status == VerificationStatus.PARTIAL or relevant.status == RelevanceStatus.PARTIAL:
-                partial.append({"claim_id": claim.claim_id, "text": claim.text[:240],
+                partial.append({"claim_id": claim.claim_id, "text": claim.text[:400],
                     "verification_status": verified.status.value, "relevance_status": relevant.status.value,
                     "verification_reason": verified.reason, "relevance_reason": relevant.reason})
                 continue
@@ -88,7 +88,7 @@ class WritingContextBuilder:
             accepted.append(WritingClaim(claim.claim_id, claim.text, tuple(claim.evidence_ids),
                 tuple(dict.fromkeys(item.source_id for item in linked_sources)), claim.task_id))
         gaps = [{"gap_id": item.gap_id, "status": item.status.value, "gap_type": item.gap_type.value,
-                 "description": item.description[:240], "missing_information": item.missing_information[:400]}
+                 "description": item.description[:400], "missing_information": item.missing_information[:600]}
                 for item in gap_store.all_gaps() if item.status in {GapStatus.OPEN, GapStatus.IMPROVED}]
         dimensions = []
         if plan is not None:
@@ -107,7 +107,7 @@ class WritingContextBuilder:
                     evidence[key] = {"source_id": fragment.source_id, "content": fragment.content[:excerpt_chars],
                                      "excerpt_truncated": len(fragment.content) > excerpt_chars}
                     source = sources[fragment.source_id]
-                    metadata[source.source_id] = {"title": source.title[:300], "url": source.url,
+                    metadata[source.source_id] = {"title": source.title[:500], "url": source.url,
                                                    "published_at": source.published_at}
             return {"goal": goal, "scope_dimensions": dimensions, "accepted_claims": claims,
                     "evidence": evidence, "sources": metadata, "open_gaps": gaps,
@@ -118,7 +118,7 @@ class WritingContextBuilder:
         max_evidence = self.settings.max_evidence_per_writing_claim
         max_excerpt = self.settings.max_writing_evidence_chars
         attempts = [(count, max_excerpt) for count in range(max_evidence, 0, -1)]
-        attempts += [(1, size) for size in (240, 160, 80) if size < max_excerpt]
+        attempts += [(1, size) for size in (400, 240, 160, 80) if size < max_excerpt]
         for per_claim, excerpt_chars in attempts:
             payload = compose(per_claim, excerpt_chars)
             text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

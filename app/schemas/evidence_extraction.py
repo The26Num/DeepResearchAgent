@@ -6,12 +6,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 EvidenceIndex = Annotated[int, Field(ge=0, strict=True)]
+MAX_EXTRACTED_CLAIM_CHARS = 3000
 
 
 class ExtractedClaim(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    text: str = Field(min_length=1, max_length=2000)
+    text: str = Field(min_length=1, max_length=MAX_EXTRACTED_CLAIM_CHARS)
     supporting_evidence_indexes: list[EvidenceIndex] = Field(min_length=1, max_length=12)
 
     @field_validator("supporting_evidence_indexes")

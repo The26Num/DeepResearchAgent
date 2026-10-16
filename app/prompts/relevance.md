@@ -21,6 +21,6 @@ Only claim text is supplied: do not invent dates or claim recency based on unsta
 
 Return exactly one result for each supplied claim_id (batch-local C1/C2 labels); copy labels exactly.
 Output ONLY claim_id, status (ALIGNED/PARTIAL/MISALIGNED), reason.
-Reason: one short sentence, at most 160 characters, identifying the match or missing topic/qualifier.
+Reason: one short sentence, at most 320 characters, identifying the match or missing topic/qualifier.
 Do not assert a topic match that is absent from the claim text.
 No long analysis, summaries, source lists, rewritten claims, queries, tasks or confidence scores.

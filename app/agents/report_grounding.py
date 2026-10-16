@@ -11,9 +11,10 @@ from openai import BadRequestError
 
 from app.config import Settings, get_settings
 from app.llm import bounded_output_options, create_verifier_llm
+from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 from app.research.runtime import ResearchRuntime
 from app.research.writing_context import WritingContext
-from app.schemas.report import ResearchReport
+from app.schemas.report import MAX_REPORT_PARAGRAPH_CHARS, MAX_REPORT_SCOPE_CHARS, MAX_REPORT_TITLE_CHARS, ResearchReport
 from app.schemas.report_grounding import ReportGroundingBatch
 
 
@@ -78,8 +79,8 @@ class ReportGroundingChecker:
         gaps = {item["gap_id"]: item for item in payload["open_gaps"]}
         partial = {item["claim_id"]: item for item in payload["partial_claims_for_limitations_only"]}
         # The goal is explicitly metadata, never a source for empirical assertions.
-        data["title"] = ("研究报告：" + context.goal)[:180]
-        data["scope"] = ("本报告的研究目标为：" + context.goal[:1000]
+        data["title"] = ("研究报告：" + context.goal)[:MAX_REPORT_TITLE_CHARS]
+        data["scope"] = ("本报告的研究目标为：" + context.goal[:MAX_REPORT_SCOPE_CHARS - 200]
                          + "。这是研究范围，不表示所有范围均已有实验依据；下文结论仅限于已接受的 Claim。")
         occurrences = []
         for field in ("executive_summary", "key_findings", "conclusion"):
@@ -162,7 +163,7 @@ class ReportGroundingChecker:
                     selected, texts = [], []
                     for cid in refs:
                         candidate = texts + [claims[cid]]
-                        if len("\n\n".join(candidate)) <= 1200:
+                        if len("\n\n".join(candidate)) <= MAX_REPORT_PARAGRAPH_CHARS:
                             selected.append(cid)
                             texts = candidate
                     if not selected:
@@ -198,6 +199,7 @@ class ReportGroundingChecker:
                             captured.append(getattr(generations[0], "message", None))
 
             options = bounded_output_options(self.model, self.settings.report_grounding_max_tokens)
+            options.update(json_object_options(self.model))
             options["timeout"] = min(self.settings.model_request_timeout_seconds, runtime.remaining())
             usage.llm_calls += 1
             try:
@@ -216,7 +218,7 @@ class ReportGroundingChecker:
                 raise ValueError("grounding response was truncated")
             return response
 
-        if self._native_available:
+        if self._native_available and not prefers_json_object(self.model):
             try:
                 result = invoke(self.model.with_structured_output(schema, method="json_schema"), messages)
                 return ReportGroundingBatch.model_validate(result)
@@ -226,9 +228,8 @@ class ReportGroundingChecker:
                     raise
                 runtime.remaining()
                 self._native_available = False
-        fallback = [SystemMessage(content=self.prompt + "\nJSON schema:\n" + json.dumps(schema, ensure_ascii=False)), messages[1]]
+        if prefers_json_object(self.model):
+            runtime.log("grounding output mode=json_object; thinking disabled")
+        fallback = [SystemMessage(content=self.prompt + json_instance_instructions(schema)), messages[1]]
         raw = invoke(self.model, fallback)
-        content = raw.text.strip()
-        if content.startswith("```") and content.endswith("```"):
-            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        return ReportGroundingBatch.model_validate_json(content)
+        return ReportGroundingBatch.model_validate(parse_json_instance(raw.text))

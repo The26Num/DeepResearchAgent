@@ -9,7 +9,7 @@ from app.schemas import Claim, Evidence, Source
 from app.schemas.task import ResearchTask
 
 
-MAX_EVIDENCE_CONTEXT_CHARS = 12000
+MAX_EVIDENCE_CONTEXT_CHARS = 18000
 
 
 def build_evidence_context(task: ResearchTask, store: EvidenceStore,

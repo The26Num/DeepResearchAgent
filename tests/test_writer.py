@@ -22,6 +22,7 @@ from app.research.report_rendering import render_report
 from app.research.runtime import ResearchTimeoutError
 from app.research.verification_store import VerificationStore
 from app.research.writing_context import WritingContextBuilder, WritingContextLimitError, WritingIntegrityError
+from app.research.writer_references import WriterReferences
 from app.schemas import (
     Claim, ClaimRelevanceResult, CompactResearchResult, Evidence, ResearchExecutionResult, ResearchGap,
     ResearchPlan, ResearchReport, ResearchTask, Source, TaskEvidenceBundle, VerificationResult,
@@ -83,6 +84,25 @@ def report_data(context, *, subset=None):
         limitations=limitations, conclusion=[paragraph])
 
 
+def label_report(data, context):
+    refs = WriterReferences.build(context)
+    maps = {"claim_ids": {value: key for key, value in refs.claims.items()},
+            "partial_claim_ids": {value: key for key, value in refs.partial.items()},
+            "gap_ids": {value: key for key, value in refs.gaps.items()}}
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in maps and isinstance(value, list):
+                    node[key] = [maps[key].get(item, item) if isinstance(item, str) else item for item in value]
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    walk(data)
+    return data
+
+
 class ModelStub:
     def __init__(self, context, *, mutate=lambda value: value, native=True):
         self.context, self.mutate, self.native = context, mutate, native
@@ -100,7 +120,7 @@ class ModelStub:
         raw = AIMessage(content="", usage_metadata={"input_tokens": 220, "output_tokens": 100, "total_tokens": 320})
         for callback in (config or {}).get("callbacks", []):
             callback.on_llm_end(SimpleNamespace(generations=[[SimpleNamespace(message=raw)]]))
-        value = self.mutate(report_data(self.context))
+        value = label_report(self.mutate(report_data(self.context)), self.context)
         return value if self.native else AIMessage(content=json.dumps(value))
 
 
@@ -129,7 +149,7 @@ def test_new_reresearch_claims_use_same_filter_and_shared_evidence_and_sources_a
     assert len(context.payload["accepted_claims"][0]["evidence_ids"]) == 3
     for item in claims:
         assert len(store.get_claim(item.claim_id).evidence_ids) == 4
-    assert all(len(item["content"]) <= 400 for item in context.payload["evidence"].values())
+    assert all(len(item["content"]) <= 600 for item in context.payload["evidence"].values())
 
 
 def test_missing_decisions_excluded_and_latest_supported_decision_controls_acceptance():
@@ -210,12 +230,12 @@ def test_empty_accepted_claims_do_not_create_model_and_return_minimal_report(mon
 
 def test_minimal_report_many_gaps_consolidates_without_losing_gap_ids():
     store, verified, relevance, gaps, _, _ = fixture([("PARTIAL", "ALIGNED")])
-    for index in range(24):
+    for index in range(40):
         gaps.add_gap(ResearchGap(task_id=f"D{index}", gap_type="COVERAGE_GAP", description="No direct answer", missing_information="More direct evidence"))
     context = WritingContextBuilder(settings=settings()).build("Goal", store, verified, relevance, gaps)
     report = ResearchWriter(settings=settings()).write(context)
     assert {key for item in report.limitations for key in item.gap_ids} == {item.gap_id for item in gaps.all_gaps()}
-    assert len(report.limitations) <= 20
+    assert len(report.limitations) <= 30
 
 
 def test_zero_accepted_gaps_do_not_fail_an_unused_llm_context_budget():
@@ -245,7 +265,7 @@ def test_one_primary_call_whole_report_traces_and_usage(native):
     for key in report.used_claim_ids:
         assert store.get_evidence_for_claim(key)
         assert store.get_sources_for_claim(key)
-    assert model.requests[0][1]["max_tokens"] == 4096 and model.requests[0][1]["timeout"] <= 60
+    assert model.requests[0][1]["max_tokens"] == 6144 and model.requests[0][1]["timeout"] <= 60
     assert all("tools" not in options for _, options in model.requests)
 
 
@@ -266,7 +286,10 @@ def test_schema_requires_all_seven_top_level_fields():
     data = report_data(context)
     del data["sections"]
     with pytest.raises(ValidationError, match="sections"):
-        ResearchWriter(ModelStub(context, mutate=lambda value: data), settings=settings()).write(context)
+        ResearchReport.model_validate(data)
+    worker = ResearchWriter(ModelStub(context, mutate=lambda value: data), settings=settings())
+    assert worker.write(context).used_claim_ids
+    assert worker.last_usage.fallback_mode == "verbatim_claims" and worker.last_usage.llm_calls == 2
 
 
 def test_model_omitting_limitations_retains_current_gaps_without_retry_or_research():
@@ -295,9 +318,10 @@ def test_unknown_claim_ids_detected_in_all_factual_sections(field):
     else:
         data[field] = [{"text": "Invented fact", "claim_ids": ["claim_999"]}]
     worker = ResearchWriter(ModelStub(context, mutate=lambda value: data), settings=settings())
-    with pytest.raises(WriterOutputError, match="unknown or non-accepted"):
-        worker.write(context)
-    assert worker.last_usage.llm_calls == 1
+    result = worker.write(context)
+    assert worker.last_usage.fallback_mode == "verbatim_claims"
+    assert "Invented fact" not in render_report(result)
+    assert worker.last_usage.llm_calls == 2
 
 
 @pytest.mark.parametrize("text", ["A fact [1]", "A fact [1, 2]", "A fact [^1]", "A fact (Author, 2025)",
@@ -359,7 +383,7 @@ def test_http_structured_output_compatibility_limits_and_usage(native, base_url)
         if not native and body.get("response_format", {}).get("type") == "json_schema":
             return httpx.Response(400, json={"error": {"message": "response_format json_schema unsupported", "type": "invalid_request_error"}})
         return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 0, "model": "test",
-            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(report_data(context))}}],
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(label_report(report_data(context), context))}}],
             "usage": {"prompt_tokens": 500, "completion_tokens": 300, "total_tokens": 800}})
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         model = ChatOpenAI(model="test", api_key="test", base_url=base_url, http_client=client, max_retries=0)
@@ -386,9 +410,9 @@ def test_timeout_or_parse_failure_does_not_retry_or_publish_report():
         worker.write(context)
     assert len(model.requests) == 1
     worker = ResearchWriter(ModelStub(context, mutate=lambda value: {"nonsense": "output"}), settings=settings())
-    with pytest.raises(ValidationError):
-        worker.write(context)
-    assert worker.last_usage.llm_calls == 1
+    result = worker.write(context)
+    assert result.used_claim_ids and worker.last_usage.fallback_mode == "verbatim_claims"
+    assert worker.last_usage.llm_calls == 2
 
 
 def test_writer_deadline_blocks_wait_and_discards_late_report():
@@ -456,16 +480,10 @@ def test_default_pipeline_writer_consumes_no_memo_and_leaves_every_research_reco
         SimpleNamespace(research=research), verifier=ClaimVerifier(SupportModel(), settings=cfg),
         gap_detector=GapDetector(RelevanceAssessor(AlignmentModel(), settings=cfg)), writer=worker,
         writing_context_builder=WritingContextBuilder(settings=cfg))
-    if writer_fails:
-        with pytest.raises(RuntimeError, match="Writer failed.*non-accepted"):
-            orchestrator.run("Original research goal")
-        assert events == ["research", "reresearch"]  # No restart after Writer rejects the report.
-        assert worker.last_usage.llm_calls == 1
-        output = capsys.readouterr().out
-        assert "Re-Research Summary:" in output and "[Writer] failed" in output
-        assert "FINAL RESEARCH REPORT" not in output
-        return
     result = orchestrator.run("Original research goal")
+    assert events == ["research", "reresearch"]
+    assert worker.last_usage.llm_calls == (2 if writer_fails else 1)
+    assert worker.last_usage.fallback_mode == ("verbatim_claims" if writer_fails else "")
     assert result.report is not None and result.report.used_claim_ids == [claim.claim_id]
     assert result.memos["D1"] == memo and result.compact_results["D1"].summary == "COMPACT_NOT_ALLOWED"
     assert result.evidence_store.get_claim(claim.claim_id) == claim
