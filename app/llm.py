@@ -37,7 +37,12 @@ def create_llm(*, verifier: bool = False, writer: bool = False) -> ChatOpenAI:
         raise ValueError("Model base URL must be an HTTP(S) API endpoint without credentials, query or fragment.")
 
     extra = {}
-    if (verifier or writer) and endpoint.hostname.endswith(".aliyuncs.com") and model_name.lower().startswith(("qwen3", "qwen-plus", "qwen-flash")):
+    if endpoint.hostname == "api.deepseek.com":
+        # DeepSeek enables thinking by default. The current ChatOpenAI tool
+        # loop does not round-trip reasoning_content, which thinking-mode
+        # tool calls require. Keep all stages on the non-thinking API path.
+        extra["extra_body"] = {"thinking": {"type": "disabled"}}
+    elif (verifier or writer) and endpoint.hostname.endswith(".aliyuncs.com") and model_name.lower().startswith(("qwen3", "qwen-plus", "qwen-flash")):
         extra["extra_body"] = {"enable_thinking": settings.writer_enable_thinking if writer else settings.verifier_enable_thinking}
     return ChatOpenAI(
         model=model_name,
@@ -62,6 +67,8 @@ def create_writer_llm() -> ChatOpenAI:
 def bounded_output_options(model, max_tokens: int) -> dict:
     """Translate output limits at the provider boundary, without mutating a model."""
     host = urlsplit(str(getattr(model, "openai_api_base", "") or "")).hostname
-    if host in {"api.siliconflow.cn", "api.siliconflow.com"}:
+    if host in {"api.siliconflow.cn", "api.siliconflow.com", "api.deepseek.com"}:
+        # These providers document max_tokens. Sending it in extra_body avoids
+        # ChatOpenAI renaming it to the OpenAI-only max_completion_tokens.
         return {"extra_body": {**(getattr(model, "extra_body", None) or {}), "max_tokens": max_tokens}}
     return {"max_tokens": max_tokens}

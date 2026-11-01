@@ -117,11 +117,28 @@ class ResearchRunStore:
             if not cursor.rowcount:
                 raise ResearchRunNotFoundError(f"Research run not found: {run_id}.")
 
+    def mark_scheduled(self, run_id):
+        """Reserve a resumed run before a worker calls the existing resume path."""
+        self._update(run_id, status="RUNNING", error_type=None, error_message=None)
+
     def mark_failed(self, run_id, error):
         self._update(run_id, status="FAILED", error_type=type(error).__name__, error_message=self.redact(str(error)))
 
     def mark_interrupted(self, run_id):
         self._update(run_id, status="INTERRUPTED", error_type="KeyboardInterrupt", error_message="Research interrupted.")
+
+    def recover_unfinished_runs(self) -> int:
+        """API startup only, with exclusive process ownership of this database.
+
+        A new single-process server has no live workers from its predecessor.
+        Keep every checkpoint/stage intact and require an explicit resume.
+        """
+        with self.connection() as conn, conn:
+            cursor = conn.execute(
+                "UPDATE research_runs SET status='INTERRUPTED', updated_at=?, "
+                "error_type='ServerRestarted', error_message='Server stopped before research finished; resume explicitly.' "
+                "WHERE status='RUNNING'", (utc_now(),))
+            return cursor.rowcount
 
     def mark_completed(self, run_id):
         checkpoint = self.load_latest_checkpoint(run_id)

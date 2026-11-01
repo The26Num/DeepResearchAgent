@@ -1,6 +1,8 @@
 import asyncio
+import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from time import monotonic
 
 from app.agents.researcher import Researcher
 from app.agents.supervisor import Supervisor
@@ -31,9 +33,12 @@ from app.research.writing_context import WritingContext, WritingContextBuilder
 from app.research.report_rendering import render_report_with_citations
 from app.research.citations import CitationIntegrityError
 from app.schemas.citation import CitationUsage, RenderedResearchReport
-from app.persistence.models import ResearchRunState, RunStatus
+from app.persistence.models import ResearchRun, ResearchRunState, RunStatus
 from app.persistence.manager import CheckpointManager, CheckpointWriteError
 from app.schemas.verification import VerificationResult
+from app.research.events import EventSink, ProgressData, ProgressUpdate
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,7 +73,7 @@ class ResearchOrchestrator:
         reresearch: bool | None = None, reresearch_planner: ReResearchPlanner | None = None,
         write_report: bool | None = None, writer: ResearchWriter | None = None,
         writing_context_builder: WritingContextBuilder | None = None,
-        run_store=None, failure_injector=None,
+        run_store=None, failure_injector=None, event_sink: EventSink | None = None,
     ) -> None:
         if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
             raise ValueError("max_concurrency must be a positive integer.")
@@ -94,19 +99,57 @@ class ResearchOrchestrator:
         self.failure_injector = failure_injector
         self._checkpoint_manager = None
         self._run_state = None
+        self.event_sink = event_sink
+        self._progress_stage = "RUN_CREATED"
+        self._task_timers = {}
+        self._completed_task_events = set()
 
-    def run(self, query: str) -> ResearchResult:
+    def _initial_state(self, query: str) -> ResearchRunState:
+        return ResearchRunState(goal=query, phase_options={key: getattr(self, key) for key in
+                                ("verify_claims", "detect_gaps", "reresearch", "write_report")},
+                                citation_debug=get_settings().show_writer_debug)
+
+    def prepare_run(self, query: str) -> ResearchRun:
+        """Persist a resumable initial run without planning or calling a model.
+
+        The API can return this ID before starting run(..., prepared_run_id=...).
+        CLI callers can continue to use run(query) directly.
+        """
+        if self.run_store is None:
+            raise ValueError("Preparing a run requires a ResearchRunStore.")
+        run = self.run_store.create_run(query)
+        try:
+            state = self._initial_state(run.goal)
+            state.completed_stages.add("RUN_CREATED")
+            self.run_store.save_checkpoint(run.run_id, "RUN_CREATED", state)
+        except Exception as error:
+            self.run_store.mark_failed(run.run_id, error)
+            raise
+        return self.run_store.get_run(run.run_id)
+
+    def run(self, query: str, *, prepared_run_id: str | None = None) -> ResearchResult:
         """Synchronous entry point for the CLI; async callers should await arun()."""
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.arun(query))
+            return asyncio.run(self.arun(query, prepared_run_id=prepared_run_id))
         raise RuntimeError("An event loop is already running; use await ResearchOrchestrator.arun(query).")
 
-    async def arun(self, query: str) -> ResearchResult:
-        state = ResearchRunState(goal=query, phase_options={key: getattr(self, key) for key in
-                                ("verify_claims", "detect_gaps", "reresearch", "write_report")},
-                                 citation_debug=get_settings().show_writer_debug)
+    async def arun(self, query: str, *, prepared_run_id: str | None = None) -> ResearchResult:
+        if prepared_run_id is not None:
+            if self.run_store is None:
+                raise ValueError("Starting a prepared run requires a ResearchRunStore.")
+            run = self.run_store.get_run(prepared_run_id)
+            checkpoint = self.run_store.load_latest_checkpoint(prepared_run_id)
+            if (run.status != RunStatus.RUNNING or run.goal != query or run.current_stage != "RUN_CREATED"
+                    or checkpoint.stage != "RUN_CREATED"
+                    or checkpoint.state.research_plan is not None
+                    or checkpoint.state.completed_stages != {"RUN_CREATED"}):
+                raise ValueError("Only an unstarted, prepared run can use prepared_run_id; otherwise use resume().")
+            manager = CheckpointManager(self.run_store, run.run_id, failure_injector=self.failure_injector)
+            manager.safe_state = checkpoint.state.model_copy(deep=True)
+            return await self._protected_execute(query, checkpoint.state, manager)
+        state = self._initial_state(query)
         manager = None
         if self.run_store is not None:
             run = self.run_store.create_run(query)
@@ -185,6 +228,34 @@ class ResearchOrchestrator:
     def _enter(self, stage):
         if self._checkpoint_manager:
             self._checkpoint_manager.enter(stage)
+        self._progress_stage = stage
+        base, _, task_id = stage.partition(":")
+        entries = {"PLANNING": ("stage_changed", "planning"), "INITIAL_RESEARCH_BATCH": ("stage_changed", "research"),
+                   "TASK_VERIFICATION": ("verification_started", "verification"),
+                   "GAP_DETECTION": ("gap_detection_started", "gap_detection"),
+                   "RERESEARCH": ("reresearch_started", "reresearch"), "WRITER": ("writer_started", "writer"),
+                   "CITATION": ("citation_started", "citation")}
+        kind, phase = entries.get(base, ("stage_changed", None))
+        self._emit(kind, task_id=task_id or None, phase=phase, phase_status="running" if phase else None,
+                   task_status="running" if task_id else None)
+
+    def _emit(self, kind, *, task_id=None, stage=None, **data):
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink(ProgressUpdate(event_type=kind, stage=stage or self._progress_stage,
+                                          task_id=task_id, progress_data=ProgressData(**data)))
+        except Exception:
+            # Observers must not alter research decisions, retries, or checkpoints.
+            logger.warning("Research progress observer unavailable.")
+
+    def _task_finished_event(self, task_id):
+        if self.event_sink is None or task_id in self._completed_task_events:
+            return
+        self._completed_task_events.add(task_id)
+        started = self._task_timers.get(task_id)
+        self._emit("task_completed", task_id=task_id, task_status="completed",
+                   elapsed_seconds=round(monotonic() - started, 3) if started is not None else None)
 
     def _save(self, stage, *, completed=True):
         state = self._capture_state()
@@ -192,6 +263,30 @@ class ResearchOrchestrator:
             state.completed_stages.add(stage)
         if self._checkpoint_manager:
             self._checkpoint_manager.save(stage, state)
+        self._progress_stage = stage
+        base, _, task_id = stage.partition(":")
+        if base in {"TASK_COMPLETED", "RERESEARCH_TASK_COMPLETED"}:
+            self._task_finished_event(task_id)
+        milestones = {"PLAN_CREATED": ("plan_created", "planning"),
+                      "INITIAL_RESEARCH_COMPLETED": ("initial_research_completed", "research"),
+                      "GAP_DETECTION_COMPLETED": ("gap_detection_completed", "gap_detection"),
+                      "RERESEARCH_COMPLETED": ("reresearch_completed", "reresearch"),
+                      "WRITER_COMPLETED": ("writer_completed", "writer"),
+                      "CITATION_COMPLETED": ("report_completed", "citation")}
+        if base in milestones:
+            kind, phase = milestones[base]
+            phases = [{"phase": "verification", "status": "completed"}] if base == "INITIAL_RESEARCH_COMPLETED" and self.verify_claims else []
+            self._emit(kind, phase=phase, phase_status="completed", phases=phases,
+                       task_count=len(state.research_plan.tasks) if state.research_plan else 0,
+                       completed_tasks=sum(task.status == "completed" for task in state.research_plan.tasks) if state.research_plan else 0)
+        if base == "RERESEARCH_PLAN_CREATED":
+            self._emit("reresearch_plan_created", phase="reresearch", phase_status="running",
+                       task_count=sum(len(plan.tasks) for plan in state.reresearch_summary.plans))
+        if base == "RERESEARCH_COMPLETED":
+            for plan in state.reresearch_summary.plans:
+                for task in plan.tasks:
+                    if task.status == "completed":
+                        self._task_finished_event(task.id)
 
     @staticmethod
     def _result_from_state(state, run_id=None):
@@ -343,6 +438,7 @@ class ResearchOrchestrator:
                         evidence_store = prior_store
                         task.status = "failed"
                         print(f"[{task.id}] failed — evidence merge: {type(error).__name__}: {error}", flush=True)
+                        self._emit("task_failed", task_id=task.id, task_status="failed")
                         failures.append((task, error))
             # The existing parallel research batch has completed and all successful
             # bundles are canonical. Verification is serial, with no scheduler rewrite.
@@ -354,11 +450,16 @@ class ResearchOrchestrator:
                         self._enter(f"TASK_VERIFICATION:{task.id}")
                         claims = evidence_store.get_claims_for_task(task.id)
                         missing = [item for item in claims if verification_store.get_latest_verification(item.claim_id) is None]
+                        verification_started = monotonic()
                         results = await asyncio.to_thread(self.verifier.verify_batch, missing, evidence_store) if missing or not claims else []
                         for item in results:
                             verification_store.add_verification(item)
+                        self._emit("verification_completed", task_id=task.id, task_status="running",
+                                   elapsed_seconds=round(monotonic() - verification_started, 3), claims=len(results))
                     except Exception as error:
                         print(f"[{task.id}] verification failed — {type(error).__name__}: {error}", flush=True)
+                        self._emit("verification_failed", task_id=task.id, task_status="failed", phase="verification", phase_status="failed")
+                        self._emit("task_failed", task_id=task.id, task_status="failed")
                         failures.append((task, error))
                     finally:
                         if missing or not claims:
@@ -589,6 +690,7 @@ class ResearchOrchestrator:
                                 raise
                             task.status = "failed"
                             summary.failures[task.id] = f"{type(error).__name__}: {error}"
+                            self._emit("task_failed", task_id=task.id, task_status="failed")
                 for task in rr_plan.tasks:
                     all_task_claims = [item for item in new_claims if item.task_id == task.id]
                     batch_claims = [item for item in all_task_claims if verified.get_latest_verification(item.claim_id) is None]
@@ -597,6 +699,8 @@ class ResearchOrchestrator:
                             task.status = "completed"
                         continue
                     try:
+                        self._emit("verification_started", task_id=task.id, task_status="running")
+                        verification_started = monotonic()
                         decisions = await asyncio.to_thread(self.verifier.verify_batch, batch_claims, store)
                         expected_claims = {item.claim_id: item for item in batch_claims}
                         if (len(decisions) != len(batch_claims)
@@ -606,10 +710,14 @@ class ResearchOrchestrator:
                             raise ValueError("Supplemental verification does not match the new claim support chains.")
                         for item in decisions:
                             verified.add_verification(item)
+                        self._emit("verification_completed", task_id=task.id, task_status="running",
+                                   elapsed_seconds=round(monotonic() - verification_started, 3), claims=len(decisions))
                     except ReResearchBudgetExhausted:
                         raise
                     except Exception as error:
                         summary.failures[task.id] = f"verification: {type(error).__name__}: {error}"
+                        self._emit("verification_failed", task_id=task.id, task_status="failed")
+                        self._emit("task_failed", task_id=task.id, task_status="failed")
                     finally:
                         usage = self.verifier.last_usage
                         verification_usage.add(usage)
@@ -756,6 +864,8 @@ class ResearchOrchestrator:
         evidence_dependencies: list[str] | None = None,
     ) -> ResearchExecutionResult:
         task.status = "running"
+        self._task_timers[task.id] = monotonic()
+        self._emit("task_started", task_id=task.id, task_status="running")
         try:
             # Isolate mutable compact results even when sibling tasks share dependencies.
             dependency_context = {
@@ -791,9 +901,13 @@ class ResearchOrchestrator:
             execution = await asyncio.to_thread(self.researcher.research, **arguments)
         except Exception as error:
             task.status = "failed"
+            self._emit("task_failed", task_id=task.id, task_status="failed",
+                       elapsed_seconds=round(monotonic() - self._task_timers[task.id], 3))
             print(f"[{task.id}] failed — {type(error).__name__}: {error}", flush=True)
             raise
         task.status = "completed"
+        self._emit("task_research_completed", task_id=task.id, task_status="running",
+                   elapsed_seconds=round(monotonic() - self._task_timers[task.id], 3))
         print(f"[{task.id}] completed", flush=True)
         return execution
 

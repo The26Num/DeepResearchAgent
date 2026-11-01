@@ -1,0 +1,38 @@
+name: deepresearch
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ${RESEARCH_ENV_FILE:-.env}
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      API_MAX_CONCURRENT_RUNS: "1"
+      API_CORS_ORIGINS: "[]"
+      RESEARCH_DB_PATH: /data/research.db
+    volumes:
+      - research_data:/data
+    expose:
+      - "8000"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+volumes:
+  research_data:

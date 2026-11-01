@@ -1,4 +1,6 @@
-from pydantic import Field
+from urllib.parse import urlsplit
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,6 +8,29 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     research_db_path: str = "workspace/research.db"
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=1, le=65535)
+    api_max_concurrent_runs: int = Field(default=1, ge=1, le=8)
+    api_sse_heartbeat_seconds: float = Field(default=15, ge=.1, le=60, allow_inf_nan=False)
+    api_sse_state_check_seconds: float = Field(default=5, ge=.1, le=30, allow_inf_nan=False)
+    api_sse_buffer_size: int = Field(default=128, ge=16, le=512)
+    api_sse_max_connections: int = Field(default=64, ge=1, le=1024)
+    api_cors_origins: list[str] = Field(default_factory=lambda: [
+        "http://localhost:5173", "http://127.0.0.1:5173",
+    ])
+
+    @field_validator("api_cors_origins")
+    @classmethod
+    def local_cors_only(cls, origins):
+        for origin in origins:
+            parts = urlsplit(origin)
+            # Origin consists only of scheme, local host, and optional port.
+            if (parts.scheme not in {"http", "https"}
+                    or parts.hostname not in {"localhost", "127.0.0.1", "::1"}
+                    or parts.username or parts.password or parts.path or parts.query or parts.fragment):
+                raise ValueError("API CORS origins must be explicit local HTTP(S) origins.")
+            _ = parts.port  # Validate port syntax/range as well.
+        return origins
 
     siliconflow_api_key: str | None = None
     model_api_key: str | None = None

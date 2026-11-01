@@ -12,6 +12,7 @@ from openai import APITimeoutError, BadRequestError, LengthFinishReasonError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.config import get_settings
+from app.llm import bounded_output_options
 from app.structured_output import json_instance_instructions, json_object_options, parse_json_instance, prefers_json_object
 from app.research.evidence_context import EvidenceContext
 from app.research.runtime import ResearchModelCallbacks, ResearchRuntime
@@ -193,16 +194,8 @@ class EvidenceExtractor:
                 f"candidates={len(payload['candidates'])} timeout={timeout:.2f}s "
                 f"max_tokens={max_tokens}"
             )
-            options = {"timeout": timeout}
+            options = {"timeout": timeout, **bounded_output_options(self.model, max_tokens)}
             host = urlsplit(str(getattr(self.model, "openai_api_base", "") or "")).hostname
-            if host in {"api.siliconflow.cn", "api.siliconflow.com"}:
-                # LangChain renames max_tokens to max_completion_tokens.
-                # SiliconFlow documents max_tokens, so send its actual field
-                # via extra_body while preserving any existing provider options.
-                options["extra_body"] = {**(getattr(self.model, "extra_body", None) or {}),
-                                         "max_tokens": max_tokens}
-            else:
-                options["max_tokens"] = max_tokens
             model_name = str(getattr(self.model, "model_name", ""))
             if host and host.endswith(".aliyuncs.com") and model_name.lower().startswith(("qwen3", "qwen-plus", "qwen-flash")):
                 # Override extraction only; the shared research model keeps its

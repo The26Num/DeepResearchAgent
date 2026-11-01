@@ -1,7 +1,7 @@
 """Provider-specific JSON transport and strict data-instance parsing.
 
-Qwen3.5 on Alibaba Cloud supports JSON Object in non-thinking mode, rather
-than native JSON Schema. Other providers retain their existing native path.
+Qwen3.5 on Alibaba Cloud and the official DeepSeek API use JSON Object,
+rather than native JSON Schema. Other providers retain their native path.
 """
 
 import json
@@ -15,12 +15,17 @@ class SchemaEchoError(ValueError):
 def prefers_json_object(model) -> bool:
     host = urlsplit(str(getattr(model, "openai_api_base", "") or "")).hostname or ""
     name = str(getattr(model, "model_name", "") or "").lower()
-    return host.endswith(".aliyuncs.com") and name.startswith("qwen3.5-")
+    return host == "api.deepseek.com" or (host.endswith(".aliyuncs.com") and name.startswith("qwen3.5-"))
 
 
 def json_object_options(model) -> dict:
     if not prefers_json_object(model):
         return {}
+    host = urlsplit(str(getattr(model, "openai_api_base", "") or "")).hostname
+    if host == "api.deepseek.com":
+        # create_llm disables thinking for DeepSeek. Do not replace extra_body
+        # here: bounded_output_options carries the per-request max_tokens in it.
+        return {"response_format": {"type": "json_object"}}
     return {"response_format": {"type": "json_object"},
             "extra_body": {**(getattr(model, "extra_body", None) or {}), "enable_thinking": False}}
 
