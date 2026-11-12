@@ -35,7 +35,7 @@ def validate_restored_state(state: ResearchRunState) -> None:
             if (state.completed_stages - {"RUN_CREATED"} or state.task_results or any(store.counts.values())
                     or state.verification_results or state.relevance_results or state.gaps
                     or state.supplemental_results or state.reresearch_summary.plans or state.research_report
-                    or state.writing_context or state.rendered_report):
+                    or state.writing_context or state.rendered_report or state.resources.tasks):
                 raise ValueError("Checkpoint has research state without a ResearchPlan.")
             return  # RUN_CREATED permits recovery even if planning was interrupted.
         validate_plan_dependencies(state.research_plan)
@@ -49,6 +49,35 @@ def validate_restored_state(state: ResearchRunState) -> None:
         if len(state.reresearch_summary.plans) > 1:
             raise ValueError("Phase 6 supports the existing single supplemental round only.")
         executions = {**state.task_results, **state.supplemental_results}
+        resources = state.resources
+        if resources.tasks and (not resources.run_id or not resources.skills):
+            raise ValueError("Resource tasks require a Run identity and pinned method catalog.")
+        for key, record in resources.tasks.items():
+            if key not in tasks or record.task_id != key:
+                raise ValueError("Resource manifest references an unknown/mismatched task.")
+            if record.committed and tasks[key].status != "completed":
+                raise ValueError("Unfinished task cannot publish its resource manifest.")
+            if any(ref.run_id != resources.run_id or key_id != ref.snapshot_id for key_id, ref in record.snapshots.items()):
+                raise ValueError("Resource snapshot belongs to a different Run or ID.")
+            if any(row.run_id != resources.run_id or row.task_id != key or row.snapshot_id not in record.snapshots
+                   or row.sequence != index + 1 for index, row in enumerate(record.readings)):
+                raise ValueError("Invalid reading ledger scope/order/reference.")
+            if set(record.allowed_tasks) - set(tasks):
+                raise ValueError("Resource access manifest has unknown task grants.")
+            if any(name not in record.limits or value > record.limits[name] for name, value in record.calls.items()):
+                raise ValueError("Resource call budget exceeds its persisted limits.")
+            from collections import Counter
+            if Counter(record.tool_history) != Counter(record.calls):
+                raise ValueError("Resource tool history does not match its counters.")
+            if record.limits and (sum(record.model_calls.values()) > record.limits["model_calls"]
+                                  or record.reserved_source_chars > record.limits["source_chars"]
+                                  or record.reserved_download_bytes > record.limits["download_bytes"]
+                                  or (record.estimated_token_budget_enforced
+                                      and record.estimated_tokens > record.limits["estimated_tokens"])):
+                raise ValueError("Cumulative task resource budget exceeds its persisted limits.")
+            if any(skill_id not in resources.skills or resources.skills[skill_id].version != version
+                   for skill_id, version in record.active_skills.items()):
+                raise ValueError("Active skill version is not pinned by this Run.")
         if set(state.task_results) - set(initial_tasks) or set(state.supplemental_results) - (set(tasks) - set(initial_tasks)):
             raise ValueError("Unknown task result in checkpoint.")
         claims = {item.claim_id: item for item in store.all_claims()}
@@ -152,6 +181,9 @@ def validate_restored_state(state: ResearchRunState) -> None:
         if state.reresearch_budget:
             from app.research.reresearch_budget import ReResearchCallBudget
             ReResearchCallBudget.restore(state.reresearch_budget)
+            allocation = state.reresearch_budget.get("allocation")
+            if allocation and set(allocation["task_limits"]) != {task.id for plan in state.reresearch_summary.plans for task in plan.tasks}:
+                raise ValueError("Supplemental budget allocations do not match the persisted plan.")
     except (ValueError, KeyError, TypeError) as error:
         raise StateIntegrityError(f"Invalid checkpoint: {error}") from error
 
@@ -159,6 +191,11 @@ def validate_restored_state(state: ResearchRunState) -> None:
 def state_from_json(text: str) -> ResearchRunState:
     try:
         raw = json.loads(text)
+        if raw.get("state_version") == 1:
+            # Pure in-memory migration. Missing historical origins remain None;
+            # no filesystem scan, page fetch or synthetic locator is performed.
+            raw["state_version"] = STATE_VERSION
+            raw.setdefault("resources", {})
         if raw.get("state_version") != STATE_VERSION:
             raise IncompatibleCheckpointError(f"Unsupported state_version={raw.get('state_version')}; expected {STATE_VERSION}.")
         state = ResearchRunState.model_validate(raw)

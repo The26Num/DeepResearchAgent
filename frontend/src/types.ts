@@ -23,6 +23,7 @@ export interface Source {
 }
 export interface Evidence {
   evidence_id: string; source_id: string; task_id: string; content: string; location: string | null;
+    origin?: { snapshot_id: string; start_char: number; end_char: number; text_hash: string; body_hash: string } | null;
 }
 export interface Claim { claim_id: string; task_id: string; text: string; evidence_ids: string[] }
 export interface Verification {

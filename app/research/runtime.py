@@ -28,6 +28,7 @@ class ResearchRuntime:
         self._lock = Lock()
         self._stages: dict[object, str] = {}
         self.call_budget = active_call_budget()
+        self.task_resources = None
 
     def _timeout_error(self) -> ResearchTimeoutError:
         with self._lock:
@@ -142,16 +143,30 @@ class ResearchModelCallbacks(BaseCallbackHandler):
     raise_error = True
     run_inline = True
 
-    def __init__(self, runtime: ResearchRuntime, stage: str = "researcher") -> None:
+    def __init__(self, runtime: ResearchRuntime, stage: str = "researcher", *, purpose: str | None = None) -> None:
         self.runtime = runtime
         self.stage = stage
+        self.purpose = purpose or stage
         self._requests: dict[object, tuple[object, float]] = {}
         self._lock = Lock()
 
     def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs) -> None:
         self.runtime.remaining()
+        def reserve_task():
+            if self.runtime.task_resources is None:
+                return
+            parameters = kwargs.get("invocation_params", {})
+            definitions = list(parameters.get("tools", ()))
+            if response_format := parameters.get("response_format"):
+                if hasattr(response_format, "model_json_schema"):
+                    response_format = response_format.model_json_schema()
+                definitions.append({"response_format": response_format})
+            self.runtime.task_resources.reserve_model(self.purpose, [item for group in messages for item in group],
+                                                      definitions)
         if self.runtime.call_budget is not None:
-            self.runtime.call_budget.reserve(self.stage)
+            self.runtime.call_budget.reserve(self.stage, task_id=self.runtime.task_id, before_reserve=reserve_task)
+        else:
+            reserve_task()
         stage = self.runtime.start_stage("model request")
         with self._lock:
             self._requests[run_id] = stage
@@ -166,6 +181,13 @@ class ResearchModelCallbacks(BaseCallbackHandler):
             self.runtime.end_stage(stage, outcome)
 
     def on_llm_end(self, response, *, run_id, **kwargs) -> None:
+        if self.runtime.task_resources is not None and not self.runtime.closed.is_set():
+            for group in getattr(response, "generations", []):
+                if group:
+                    usage = getattr(getattr(group[0], "message", None), "usage_metadata", None)
+                    if usage:
+                        self.runtime.task_resources.add_usage(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+                        break
         self._end(run_id, "completed")
         self.runtime.remaining()
 

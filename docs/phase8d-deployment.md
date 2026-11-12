@@ -71,6 +71,8 @@ docker compose up -d --force-recreate --wait backend
 
 Run、报告、证据和 Checkpoint 都在同一 SQLite 数据库中，不依赖镜像文件层。Named Volume 同时保留数据库、WAL / SHM 和 API 进程锁。事件仅保留在有界内存，不在 Volume 中历史重放。
 
+Research Archive 更新后，新 Run 的原始响应、规范正文与固定技能版本另外存于 `/data/source_archive`，也使用原 `research_data` 卷。**恢复所需备份必须包含数据库与整个档案目录**，下方 SQLite 命令只备份数据库。停止研究写入后，将两者一起复制到卷外；仅搬迁数据库不能恢复依赖档案的 v2 Run。资料格式、版本迁移和升级步骤见 [Research Archive & Skills](research-archive-and-skills.md#checkpoint-与升级)。
+
 一致性备份使用 SQLite backup API，不直接复制活跃 WAL 数据库的单个主文件：
 
 ```powershell
@@ -96,6 +98,8 @@ docker compose up -d --wait
 ```
 
 通过历史页检查原 Run ID、报告和可恢复状态。不要同时运行两个 backend、多个 Uvicorn worker，或让 CLI / Evaluation 在另一进程使用同一卷执行研究。只读历史查询可在容器内执行 `docker compose exec -T backend python main.py --list-runs`。
+
+如果本机库已包含 Research Archive v2 状态，在启动研究前还要把 `SOURCE_ARCHIVE_PATH` 下的 Run 子目录复制到容器 `/data/source_archive`，并确保 uid/gid 10001 可读写。相对路径、ID 和哈希保持原样，不替换成新抓取文件；旧 v1 数据没有档案时保留为空，不伪造定位。
 
 ## 独立 Docker 验收
 

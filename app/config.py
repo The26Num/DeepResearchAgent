@@ -8,6 +8,28 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     research_db_path: str = "workspace/research.db"
+    source_archive_path: str = "workspace/source_archive"
+    max_source_response_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
+    max_task_download_bytes: int = Field(default=32 * 1024 * 1024, ge=1024)
+    max_run_archive_bytes: int = Field(default=128 * 1024 * 1024, ge=1024)
+    max_run_archive_snapshots: int = Field(default=128, ge=1, le=2048)
+    source_preview_chars: int = Field(default=2400, ge=100, le=12000)
+    max_source_read_chars: int = Field(default=4000, ge=100, le=12000)
+    max_task_source_chars: int = Field(default=24000, ge=100)
+    max_source_catalog_calls: int = Field(default=8, ge=0, le=100)
+    max_source_search_calls: int = Field(default=8, ge=0, le=100)
+    max_source_read_calls: int = Field(default=12, ge=0, le=100)
+    max_research_skills: int = Field(default=2, ge=0, le=8)
+    max_skill_load_calls: int = Field(default=4, ge=0, le=32)
+    max_skill_reference_calls: int = Field(default=4, ge=0, le=32)
+    max_skill_file_chars: int = Field(default=12000, ge=500, le=50000)
+    max_task_skill_chars: int = Field(default=18000, ge=500, le=100000)
+    max_research_model_calls: int = Field(default=14, ge=5, le=64)
+    max_research_context_estimated_tokens: int = Field(default=65536, ge=8192)
+    research_model_max_tokens: int = Field(default=3072, ge=512, le=8192)
+    max_task_estimated_tokens: int = Field(default=300000, ge=8192)
+    enforce_task_estimated_token_budget: bool = True
+    max_extraction_candidates: int = Field(default=96, ge=12, le=256)
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_max_concurrent_runs: int = Field(default=1, ge=1, le=8)

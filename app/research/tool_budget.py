@@ -33,20 +33,42 @@ class ToolBudget:
     calls: list[str] = field(default_factory=list)
     report: Callable[[str], None] | None = None
     runtime: ResearchRuntime | None = None
+    resources: object | None = None
     readings: list[dict] = field(default_factory=list)
     attempted_urls: list[str] = field(default_factory=list)
+    search_urls: list[str] = field(default_factory=list)
     lock: Lock = field(default_factory=Lock, repr=False, compare=False)
 
     def reserve(self, name: str) -> tuple[int, int] | None:
         with self.lock:
+            if name not in {"web_search", "fetch_webpage"}:
+                return None
             field_name, maximum = (("search_calls", self.max_search_calls) if name == "web_search"
                                    else ("fetch_calls", self.max_fetch_calls))
             used = getattr(self, field_name)
             if used >= maximum:
                 return None
+            if self.resources:
+                from app.research.task_resources import ResearchBudgetExceeded
+                try:
+                    self.resources.reserve_tool(name)
+                except ResearchBudgetExceeded:
+                    return None
             setattr(self, field_name, used + 1)
             self.calls.append(name)
             return used + 1, maximum
+
+    def reserve_local(self, name):
+        if not self.resources:
+            return False
+        from app.research.task_resources import ResearchBudgetExceeded
+        try:
+            self.resources.reserve_tool(name)
+        except ResearchBudgetExceeded:
+            return False
+        with self.lock:
+            self.calls.append(name)
+        return True
 
     def record_reading(self, raw: str, requested_url: str | None = None) -> None:
         """Keep successful fetch artifacts local; search candidates never enter here."""
@@ -66,12 +88,27 @@ class ToolBudget:
             if not isinstance(text, str) or not text.strip() or not isinstance(url, str):
                 return
             normalize_source_url(url)
+            if self.resources:
+                page = self.resources.capture_legacy(page)
+                text = page["text"]
             reading = {"url": url, "title": str(page.get("title") or ""),
                        "published_at": str(page.get("published_at") or ""), "text": text[:12000]}
             with self.lock:
                 if reading not in self.readings:
                     self.readings.append(reading)
         except (TypeError, ValueError):
+            return
+
+    def record_search(self, raw):
+        try:
+            data = json.loads(raw)
+            urls = [row["url"] for row in data.get("results", []) if isinstance(row, dict) and isinstance(row.get("url"), str)]
+            if self.resources:
+                self.resources.remember_search_urls(urls)
+                urls = self.resources.snapshot().search_urls
+            with self.lock:
+                self.search_urls = list(dict.fromkeys([*self.search_urls, *urls]))[:15]
+        except (ValueError, TypeError, AttributeError):
             return
 
     @classmethod
@@ -103,9 +140,20 @@ def budgeted_tools(
 
     def execute(selected: BaseTool, arguments: dict, name: str) -> str:
         operation = budget.runtime.operation(name) if budget.runtime else nullcontext()
-        with operation as outcome:
+        resource_context = budget.resources.activate() if budget.resources else nullcontext()
+        with operation as outcome, resource_context:
             raw = selected.invoke(arguments)
+            if name == "web_search":
+                budget.record_search(raw)
             if name == "fetch_webpage":
+                if budget.resources:
+                    try:
+                        page = json.loads(raw)
+                    except (TypeError, ValueError):
+                        page = None
+                    if isinstance(page, dict) and not page.get("error") and isinstance(page.get("text"), str) and page["text"].strip():
+                        page = budget.resources.capture_legacy(page, arguments.get("max_chars", 2400))
+                        raw = json.dumps(page, ensure_ascii=False)
                 budget.record_reading(raw, arguments.get("url"))
             if budget.report:
                 try:
@@ -146,8 +194,8 @@ def budgeted_tools(
         return with_remaining(raw, "web_search", used, maximum)
 
     @tool("fetch_webpage")
-    def limited_fetch(url: str, max_chars: int = 7500) -> str:
-        """Read one important HTML source page, within this task's fetch budget."""
+    def limited_fetch(url: str, max_chars: int = 7500, refresh: bool = False) -> str:
+        """Archive one HTML response and return a bounded preview and snapshot_id. Reuse saved content unless refresh=true."""
         if budget.runtime:
             budget.runtime.remaining()
         reservation = budget.reserve("fetch_webpage")
@@ -158,7 +206,10 @@ def budgeted_tools(
         used, maximum = reservation
         if budget.report:
             budget.report(f"fetch_webpage {used}/{maximum} url={url}")
-        raw = execute(fetch_tool, {"url": url, "max_chars": max_chars}, "fetch_webpage")
+        arguments = {"url": url, "max_chars": max_chars}
+        if refresh:
+            arguments["refresh"] = True
+        raw = execute(fetch_tool, arguments, "fetch_webpage")
         return with_remaining(raw, "fetch_webpage", used, maximum)
 
     return [limited_search, limited_fetch]

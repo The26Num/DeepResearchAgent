@@ -35,7 +35,7 @@ class EvidenceStore:
         self._source_aliases: dict[str, str] = {}
         self._evidence_aliases: dict[str, str] = {}
         self._evidence_alias_origins: dict[str, tuple[str, str | None]] = {}
-        self._evidence_keys: dict[tuple[str, str], str] = {}
+        self._evidence_keys: dict[tuple, str] = {}
         self._source_users: dict[str, tuple[str, ...]] = {}
         self._evidence_users: dict[str, tuple[str, ...]] = {}
         self._evidence_claims: dict[str, tuple[str, ...]] = {}
@@ -62,9 +62,11 @@ class EvidenceStore:
             index[key] = (*index.get(key, ()), value)
 
     @staticmethod
-    def _key(item: Evidence) -> tuple[str, str]:
+    def _key(item: Evidence) -> tuple:
         # Case and punctuation remain significant; preserve first content/location.
-        return item.source_id, " ".join(item.content.split())
+        origin = item.origin
+        version = (origin.snapshot_id, origin.start_char, origin.end_char, origin.text_hash, origin.body_hash) if origin else None
+        return item.source_id, " ".join(item.content.split()), version
 
     def merge(self, bundle: TaskEvidenceBundle) -> TaskEvidenceBundle:
         """Remap Source -> Evidence -> Claim atomically; no Claim text dedup.

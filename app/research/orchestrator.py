@@ -37,6 +37,8 @@ from app.persistence.models import ResearchRun, ResearchRunState, RunStatus
 from app.persistence.manager import CheckpointManager, CheckpointWriteError
 from app.schemas.verification import VerificationResult
 from app.research.events import EventSink, ProgressData, ProgressUpdate
+from app.research.task_resources import RunResources
+from app.structured_output import prefers_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,7 @@ class ResearchOrchestrator:
         self._progress_stage = "RUN_CREATED"
         self._task_timers = {}
         self._completed_task_events = set()
+        self._resources = None
 
     def _initial_state(self, query: str) -> ResearchRunState:
         return ResearchRunState(goal=query, phase_options={key: getattr(self, key) for key in
@@ -204,7 +207,12 @@ class ResearchOrchestrator:
 
     async def _protected_execute(self, query, state, manager, *, new=False):
         self._checkpoint_manager, self._run_state = manager, state
+        self._resources = None
         try:
+            if state.resources.run_id:
+                self._resources = RunResources(get_settings(), manager.run_id if manager else state.resources.run_id,
+                                               state.resources, on_permit=manager.reserve_resources if manager else None)
+                self._resources.validate()
             if manager and new:
                 state.completed_stages.add("RUN_CREATED")
                 manager.save("RUN_CREATED", state)
@@ -222,6 +230,8 @@ class ResearchOrchestrator:
                 manager.store.mark_failed(manager.run_id, error)
             raise
         finally:
+            if self._resources:
+                self._resources.close()
             if manager:
                 manager.closed = True
 
@@ -258,6 +268,14 @@ class ResearchOrchestrator:
                    elapsed_seconds=round(monotonic() - started, 3) if started is not None else None)
 
     def _save(self, stage, *, completed=True):
+        base, _, task_id = stage.partition(":")
+        if self._resources and base in {"TASK_COMPLETED", "RERESEARCH_TASK_COMPLETED"}:
+            self._resources.commit(task_id)
+        if self._resources and base == "RERESEARCH_COMPLETED":
+            for plan in self._run_state.reresearch_summary.plans:
+                for task in plan.tasks:
+                    if task.status == "completed":
+                        self._resources.commit(task.id)
         state = self._capture_state()
         if completed:
             state.completed_stages.add(stage)
@@ -340,6 +358,8 @@ class ResearchOrchestrator:
             state.gaps = gap_store.all_gaps()
             state.research_report, state.writing_context, state.writer_usage = report, writing_context, writer_usage
             state.rendered_report = rendered_report
+            if self._resources:
+                state.resources = self._resources.snapshot()
             return state
         self._capture_state = capture
         if plan is None:
@@ -637,6 +657,17 @@ class ResearchOrchestrator:
                     raise ValueError("Supplemental plan does not match the selected groups or round budget.")
                 summary.plans[:] = [rr_plan]
                 summary.rounds = 1
+                if any(task.id not in supplemental for task in rr_plan.tasks):
+                    self._ensure_research_agents()
+                if isinstance(self.researcher, Researcher):
+                    # Research workers must not consume the calls needed to
+                    # publish, verify and assess their own supplemental Claims.
+                    extraction_calls = 1 if prefers_json_object(self.researcher.model) else 2
+                    verify_calls = (6 + settings.max_verify_claims_per_batch - 1) // settings.max_verify_claims_per_batch
+                    relevance_calls = (6 * len(rr_plan.tasks) + settings.max_relevance_claims_per_batch - 1) // settings.max_relevance_claims_per_batch
+                    budget.configure_tasks([task.id for task in rr_plan.tasks], extraction_calls=extraction_calls,
+                        verification_calls=verify_calls, relevance_calls=relevance_calls)
+                    print(f"[Re-Research] reserved call allocations: {budget.snapshot()['allocation']['task_limits']}", flush=True)
                 checkpoint("RERESEARCH_PLAN_CREATED")
                 for task in rr_plan.tasks:
                     group = next(group for group in groups if group.task_id == task.origin_task_id)
@@ -646,8 +677,6 @@ class ResearchOrchestrator:
                         print(f"  origin_gap_ids={task.origin_gap_ids}", flush=True)
                 new_claims = [claim for task in rr_plan.tasks for claim in store.get_claims_for_task(task.id)]
                 pending = [task for task in rr_plan.tasks if task.id not in supplemental]
-                if pending:
-                    self._ensure_research_agents()
                 # Same bounded gather/to_thread mechanism as the original scheduler.
                 for offset in range(0, len(pending), self.max_concurrency):
                     if budget.exhausted:
@@ -764,7 +793,9 @@ class ResearchOrchestrator:
                 if summary.failures:
                     summary.stop_reason = "round limit reached; supplemental task failures"
                 if budget.exhausted:
-                    summary.stop_reason = "budget exhausted"
+                    summary.stop_reason = ("round complete; allocated call budget consumed"
+                        if not summary.failures and any(budget.has_task_allocation(task.id) for task in rr_plan.tasks)
+                        else "budget exhausted")
         except ReResearchBudgetExhausted:
             summary.stop_reason = "budget exhausted"
         except Exception as error:
@@ -866,6 +897,7 @@ class ResearchOrchestrator:
         task.status = "running"
         self._task_timers[task.id] = monotonic()
         self._emit("task_started", task_id=task.id, task_status="running")
+        resources = None
         try:
             # Isolate mutable compact results even when sibling tasks share dependencies.
             dependency_context = {
@@ -874,6 +906,12 @@ class ResearchOrchestrator:
             }
             if isinstance(self.researcher, Researcher):
                 allowed = task.depends_on if evidence_dependencies is None else evidence_dependencies
+                if self._resources is None:
+                    manager = self._checkpoint_manager
+                    self._resources = RunResources(get_settings(), manager.run_id if manager else None,
+                                                   self._run_state.resources if self._run_state else None,
+                                                   on_permit=manager.reserve_resources if manager else None)
+                resources = self._resources.start_task(task, allowed)
                 artifacts = build_evidence_context(task, evidence_store, allowed)
                 if task.depends_on:
                     print(f"[{task.id}] upstream evidence: claims={len(artifacts.claims)} "
@@ -898,6 +936,7 @@ class ResearchOrchestrator:
             arguments = {"task": task, "context": dependency_context, "goal": query}
             if isinstance(self.researcher, Researcher):
                 arguments["evidence_context"] = artifacts
+                arguments["resources"] = resources
             execution = await asyncio.to_thread(self.researcher.research, **arguments)
         except Exception as error:
             task.status = "failed"
@@ -905,6 +944,10 @@ class ResearchOrchestrator:
                        elapsed_seconds=round(monotonic() - self._task_timers[task.id], 3))
             print(f"[{task.id}] failed — {type(error).__name__}: {error}", flush=True)
             raise
+        finally:
+            if resources:
+                resources.close()
+                resources.persist(final=True)
         task.status = "completed"
         self._emit("task_research_completed", task_id=task.id, task_status="running",
                    elapsed_seconds=round(monotonic() - self._task_timers[task.id], 3))
@@ -938,7 +981,8 @@ class ResearchOrchestrator:
             execution = executions[task.id]
             counts = Counter(execution.tools_used)
             tools_line = ", ".join(
-                f"{name} x{counts[name]}" for name in ("web_search", "fetch_webpage") if counts[name]
+                f"{name} x{counts[name]}" for name in ("web_search", "fetch_webpage", "list_sources", "search_sources",
+                                                      "read_source", "load_research_skill", "read_skill_reference") if counts[name]
             )
             print(
                 "\n" + "=" * 40 + f"\n研究摘要 — {task.id}\n" + "=" * 40

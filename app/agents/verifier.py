@@ -126,7 +126,7 @@ class ClaimVerifier:
             options.update(json_object_options(self.model))
             options["timeout"] = min(self.settings.model_request_timeout_seconds, runtime.remaining())
             if runtime.call_budget is not None:
-                runtime.call_budget.reserve("verification")
+                runtime.call_budget.reserve("verification", task_id=runtime.task_id)
             runtime.log(f"verification batch {batch_index}/{batch_count}: claims={len(context.claims)} "
                         f"context_chars={context.context_chars} format_retry={format_retry}/{retry_limit} "
                         f"request_timeout={options['timeout']:.2f}s")

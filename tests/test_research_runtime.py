@@ -244,7 +244,9 @@ def test_tool_failure_and_completion_logs_include_outcome_and_duration(capsys):
 
 def test_parallel_timeout_retains_completed_memo_and_stops_pending_tasks(monkeypatch, capsys):
     monkeypatch.setattr(researcher_module, "get_settings", lambda: SimpleNamespace(
-        research_task_timeout_seconds=0.15, research_progress_interval_seconds=0.03,
+        # The successful sibling now fsyncs immutable source/skill files. Allow
+        # local disk scheduling while the blocked sibling still hits a deadline.
+        research_task_timeout_seconds=0.75, research_progress_interval_seconds=0.05,
     ))
     release, stopped = Event(), Event()
     plan = ResearchPlan(goal="Research", tasks=[
@@ -301,7 +303,7 @@ def test_model_has_explicit_timeout_and_retry_configuration(monkeypatch):
     assert model.client._client.max_retries == 1
 
 
-def test_native_deep_agent_uses_prefetched_evidence_and_model_callbacks(capsys):
+def test_native_langchain_agent_uses_prefetched_evidence_and_model_callbacks(capsys):
     observed = []
 
     class AnalysisModel(BaseChatModel):

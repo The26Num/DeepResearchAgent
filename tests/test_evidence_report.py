@@ -85,8 +85,15 @@ def test_orchestrator_rerenders_metadata_after_cross_task_canonical_merge():
     researcher = Researcher(SimpleNamespace(), lambda budget: Agent(), evidence_extractor=Extractor())
     result = ResearchOrchestrator(SimpleNamespace(create_plan=lambda query: plan), researcher, verify_claims=False, reresearch=False, write_report=False).run("Research")
     assert result.evidence_store.counts == {"sources": 1, "evidence": 1, "claims": 2}
-    assert "Original D1" in result.memos["D2"] and "Original D2" not in result.memos["D2"]
-    assert result.compact_results["D2"].sources[0].title == "Original D1"
+    # Identical immutable snapshots retain the first saved metadata; either
+    # parallel fetch may win. Both rendered outputs must match the canonical
+    # graph, regardless of which task reached the archive first.
+    canonical = result.evidence_store.get_sources_for_task("D1")[0]
+    assert canonical.title in {"Original D1", "Original D2"}
+    other_title = "Original D2" if canonical.title == "Original D1" else "Original D1"
+    for key in ("D1", "D2"):
+        assert canonical.title in result.memos[key] and other_title not in result.memos[key]
+        assert result.compact_results[key].sources[0].title == canonical.title
 
 
 def test_synthesis_recovers_reachable_discovery_dimensions_without_unrelated_tasks():

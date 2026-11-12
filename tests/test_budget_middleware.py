@@ -15,7 +15,7 @@ def test_exhausted_tool_is_hidden_and_current_budget_is_injected():
                            tools=[{"name": "web_search"}, {"function": {"name": "fetch_webpage"}}, {"name": "write_todos"}])
     captured = []
     ResearchBudgetMiddleware(budget).wrap_model_call(request, lambda value: captured.append(value))
-    assert captured[0].tools == request.tools[1:]
+    assert captured[0].tools == request.tools[1:2]  # Unregistered tools are denied.
     assert "web_search=0 remaining" in captured[0].system_message.text
     assert "fetch_webpage=1 remaining" in captured[0].system_message.text
     assert request.system_message.text == "Original instructions" and len(request.tools) == 3
@@ -53,7 +53,7 @@ def test_only_exhausted_calls_end_the_agent_pass_without_publishing_planning_tex
 
 
 @pytest.mark.parametrize("hallucinate_hidden_tool", [False, True])
-def test_native_deep_agent_stops_advertising_source_tools_as_they_are_consumed(monkeypatch, hallucinate_hidden_tool):
+def test_native_langchain_agent_stops_advertising_source_tools_as_they_are_consumed(monkeypatch, hallucinate_hidden_tool):
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
@@ -80,10 +80,10 @@ def test_native_deep_agent_stops_advertising_source_tools_as_they_are_consumed(m
             return "budget-integration-test"
 
         def bind_tools(self, tools, **kwargs):
-            self._bound = [item.name if hasattr(item, "name") else item["name"] for item in tools]
-            return self
+            return self.bind(advertised_tools=[item.name if hasattr(item, "name") else item["name"] for item in tools])
 
         def _generate(self, messages, **kwargs):
+            self._bound = kwargs.get("advertised_tools", [])
             self._turn += 1
             if self._turn == 1:
                 assert "web_search" in self._bound and "fetch_webpage" in self._bound

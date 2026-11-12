@@ -20,8 +20,9 @@ from app.schemas.verification import VerificationResult
 from app.schemas.relevance import ClaimRelevanceResult
 from app.schemas.report import ResearchReport
 from app.schemas.citation import RenderedResearchReport
+from app.research.resource_models import RunResourceState
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 class RunStatus(str, Enum):
@@ -85,6 +86,7 @@ class ResearchRunState(BaseModel):
     completed_stages: set[str] = Field(default_factory=set)
     # Explicit allowlist, never Settings/model/tool objects or credentials.
     phase_options: dict[str, bool] = Field(default_factory=dict)
+    resources: RunResourceState = Field(default_factory=RunResourceState)
 
 
 class Checkpoint(BaseModel):

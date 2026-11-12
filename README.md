@@ -2,7 +2,7 @@
 
 将开放式研究问题转化为任务 DAG，搜索与读取资料，建立可追溯证据，再生成带编号引用的研究报告。
 
-**Python · DeepAgents / LangGraph · FastAPI · React / TypeScript · SSE · SQLite · Docker Compose**
+**Python · LangChain create_agent / LangGraph · FastAPI · React / TypeScript · SSE · SQLite · Docker Compose**
 
 ## Project Overview
 
@@ -14,6 +14,8 @@ DeepResearch Agent 是面向学术调研与行业研究的个人研究工作台�
 
 - **Research Task DAG**：动态拆分 discovery / analysis / synthesis，校验依赖，按批次并行调度；单任务保留独立消息、工具与调用预算。
 - **EvidenceStore**：从成功读取的原文提取 Source、Evidence、Claim，运行内去重、合并 provenance，供下游任务复用。
+- **Source Archive + Reading Ledger**：完整保存成功获取的 HTML 响应与可提取正文；Researcher 按需检索、分段读取。新 Evidence 校验快照、精确字符范围和哈希，保存全文不等于模型读过全文。
+- **Runtime Research Skills**：学术综述、技术比较、行业分析三类方法按需加载，默认最多激活两类；按 Run 固定版本，恢复时沿用已固定文件。
 - **Claim Verification**：按批次判断证据支持程度；单独判断 Claim 与总体目标的相关性。
 - **Gap-Driven Re-Research**：程序识别支持、相关性与覆盖缺口，在任务、轮次、搜索和模型调用预算内补研究。
 - **Evidence-Grounded Report**：只将 `SUPPORTED + ALIGNED` Claim 用于正式发现，检查段落与标题的支持关系；必要时保守回退。
@@ -33,7 +35,9 @@ flowchart LR
     API --> Pipeline
     Eval[Evaluation CLI] --> Pipeline
     Pipeline --> Agents[Supervisor / Researcher / Verifier / Writer]
-    Agents --> Tools[web_search / fetch_webpage]
+    Agents --> Tools[web_search / fetch_webpage / local reading]
+    Tools <--> Archive[Immutable Source Archive + Reading Ledger]
+    Agents --> Skills[Progressively Loaded Research Skills]
     Agents --> Models[OpenAI-compatible 模型接口]
     Pipeline <--> Store[EvidenceStore + SQLite Checkpoint]
     Pipeline --> Sink[EventSink]
@@ -41,6 +45,8 @@ flowchart LR
 ```
 
 各 Agent 角色对应独立提示、上下文和调用边界，可以复用同一个模型服务；不要求每个角色拥有独立模型或服务进程。后端默认同时运行 1 个 Run，Run 内 DAG 仍可并行。研究在后台线程执行，HTTP 请求不等待整份报告完成。
+
+Researcher 使用 LangChain 的 `create_agent` 处理模型与工具循环；Python Orchestrator 继续管理任务 DAG。资料权限、预算、上下文压缩和技能版本由项目管理，其他单次调用组件保持现有执行方式。
 
 ### Project Structure
 
@@ -52,6 +58,7 @@ flowchart LR
 │   ├── persistence/            # SQLite Run / Checkpoint / 恢复
 │   ├── prompts/                # 各角色提示
 │   ├── research/               # DAG、证据、预算、缺口、引用、事件
+│   ├── research_skills/        # 产品方法及 references；不同于 .agents/skills
 │   ├── schemas/                # Task / Source / Evidence / Claim / Report
 │   ├── tools/                  # 搜索和 HTML 读取
 │   ├── config.py
@@ -135,7 +142,7 @@ Judge 是基于报告与有限来源摘录的模型第二意见，评分 **0～4
 
 | 层 | 实现 |
 | --- | --- |
-| 研究运行时 | Python ≥3.11、DeepAgents、LangChain、LangGraph |
+| 研究运行时 | Python ≥3.11、LangChain create_agent、LangGraph |
 | 模型接口 | langchain-openai / OpenAI SDK；DeepSeek、百炼 Qwen、SiliconFlow 参数适配 |
 | 搜索与读取 | Tavily / DuckDuckGo；Requests、BeautifulSoup |
 | 数据与验证 | Pydantic v2、SQLite WAL、安全 JSON Checkpoint |
@@ -206,6 +213,8 @@ docker compose down
 
 `research_data` Named Volume 挂载 `/data`，数据库固定 `/data/research.db`。普通 restart / down / up 保留 Volume、报告和 Checkpoint。**`down --volumes` 会删除研究数据，不用于日常重启。** 保持 Compose 项目名一致，否则会使用另一份 Volume。
 
+资料快照和固定版本的 Research Skills 存在同一卷的 `/data/source_archive`。备份、迁移或恢复新 Run 时，需要同时保留数据库与档案目录；新旧 checkpoint 的兼容和升级步骤见 [Research Archive & Skills](docs/research-archive-and-skills.md)。
+
 容器默认使用独立新库，**不会自动导入本机 `workspace/research.db`**。迁移、一致性备份、环境更新和独立验收见 [Docker 部署说明](docs/phase8d-deployment.md)。
 
 `.dockerignore` 排除真实 `.env`、数据库、workspace、Git、虚拟环境和 node_modules；密钥仅在运行时注入 backend。前后端使用非 root 用户，仅前端端口绑定主机 loopback。部署为 **单 backend / 单 worker / 单数据库实例**，不支持水平扩容。
@@ -223,6 +232,11 @@ docker compose down
 | `MODEL_REQUEST_TIMEOUT_SECONDS` | 请求超时，各阶段另有总预算。 |
 | `*_MAX_TOKENS` / `MAX_*_CONTEXT_CHARS` | 分阶段输出/输入额度；放宽额度不保证结果更好。 |
 | `RESEARCH_DB_PATH` | 本地默认 `workspace/research.db`，Compose 覆盖为 `/data/research.db`。 |
+| `SOURCE_ARCHIVE_PATH` | 本地默认 `workspace/source_archive`，Compose 覆盖为 `/data/source_archive`。 |
+| `MAX_SOURCE_*` / `MAX_TASK_SOURCE_CHARS` | 本地目录、检索、读取次数与正文字符额度；跨 Resume 累计。 |
+| `MAX_RESEARCH_SKILLS` / `MAX_SKILL_*` | 方法数量、加载次数、文件大小和累计方法文本限制。 |
+| `MAX_RESEARCH_MODEL_CALLS` / `MAX_RESEARCH_CONTEXT_ESTIMATED_TOKENS` / `MAX_TASK_ESTIMATED_TOKENS` | 单任务 Researcher 全链路调用、单次上下文和累计保守估算额度；不同于供应商实际 usage。 |
+| `ENFORCE_TASK_ESTIMATED_TOKEN_BUDGET` | 默认 true；false 关闭任务累计估算额度拦截，旧 Run 的未完成任务恢复时也生效；继续记录用量，其他限制独立生效。 |
 | `API_HOST` / `API_PORT` | 本地 `127.0.0.1:8000`，Compose 使用容器内 `0.0.0.0:8000`。 |
 | `API_MAX_CONCURRENT_RUNS` | 默认 1，本部署固定为 1；不提供持久化队列。 |
 | `API_CORS_ORIGINS` | 本地明确允许的 loopback Origin；Docker 同源代理为 `[]`。 |
@@ -288,12 +302,15 @@ Remove-Item Env:RUN_DOCKER_TESTS
 
 本次验证及未实测部分见 [Phase 8D 验收说明](docs/phase8d-deployment.md#验证记录)。离线通过不代表所有模型、网页和网络条件下研究都会成功。
 
+资料尾部定位、Skills 加载、精确 Evidence、验证、引用与恢复的离线实测及低预算运行步骤见 [Research Archive & Skills](docs/research-archive-and-skills.md#验证)。
+
 ## Known Limitations
 
 - **模型与来源**：会遗漏方向、误判支持/相关性或输出不合法字段；搜索不保证全面，部分 HTML、PDF、动态或受限站点无法读取。容器化不改变这些限制。
 - **报告质量**：完整引用链、SUPPORTED 与 Grounding 不能保证没有事实错误；材料不足可能生成保守或较短的报告。
 - **成本**：多轮请求、重复上下文、抽取和补研究可能显著增加 tokens，不保证优于简单 Baseline。
 - **执行与恢复**：单 backend、单 worker，没有分布式队列或取消功能；未提交操作可能重做，不保证任意位置的精确一次执行。
+- **资料档案**：仅支持现有 HTML 范围，不含 PDF/OCR/动态浏览器抓取；每 Run 有磁盘上限，跨 Run 总量与清理仍由部署者管理。缺失或损坏的原档案会阻止依赖它的继续研究，不会悄悄下载替代。
 - **SSE**：有界内存，不完整重放历史；刷新/重启从 SQLite 恢复当前状态，时间线记录本页收到的事件。
 - **部署**：面向本机/可信环境，没有鉴权、多租户、TLS 或公网访问控制。基础镜像与 Python 依赖尚未锁定到内容摘要。
 - **验收**：开发机未安装 Docker Engine，容器构建、Nginx 启动与 Volume 重启尚未实测，已有独立验收用例。

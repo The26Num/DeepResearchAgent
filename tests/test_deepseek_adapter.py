@@ -184,7 +184,7 @@ def test_all_seven_structured_stages_use_documented_transport_without_extra_call
     assert len(requests) == (2 if stage in {"supervisor", "writer_grounding"} else 1)
 
 
-def test_researcher_actual_deepagents_tool_round_trip(model_factory, monkeypatch):
+def test_researcher_actual_langchain_tool_round_trip(model_factory, monkeypatch):
     requests = []
 
     @tool

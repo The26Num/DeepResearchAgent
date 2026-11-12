@@ -156,7 +156,7 @@ class ResearchRunStore:
             run = conn.execute("SELECT * FROM research_runs WHERE run_id=?", (run_id,)).fetchone()
             if run is None:
                 raise ResearchRunNotFoundError(f"Research run not found: {run_id}.")
-            if run["state_version"] != STATE_VERSION:
+            if run["state_version"] not in {1, STATE_VERSION}:
                 raise IncompatibleCheckpointError("Research run state_version is incompatible.")
             if checked.goal != run["goal"]:
                 raise StateIntegrityError("Checkpoint goal does not match its ResearchRun.")
@@ -164,8 +164,10 @@ class ResearchRunStore:
             cursor = conn.execute("INSERT INTO checkpoints(run_id,sequence,stage,state_json,created_at) VALUES (?,?,?,?,?)",
                                   (run_id, sequence, stage, text, created))
             checkpoint_id = cursor.lastrowid
-            conn.execute("UPDATE research_runs SET last_checkpoint_id=?,current_stage=?,updated_at=? WHERE run_id=?",
-                         (checkpoint_id, stage, created, run_id))
+            if checked.resources.run_id and checked.resources.run_id != run_id:
+                raise StateIntegrityError("Checkpoint resource Run ID does not match its ResearchRun.")
+            conn.execute("UPDATE research_runs SET last_checkpoint_id=?,current_stage=?,updated_at=?,state_version=? WHERE run_id=?",
+                         (checkpoint_id, stage, created, STATE_VERSION, run_id))
         print(f"[Checkpoint] run_id={run_id} sequence={sequence} stage={stage} state_chars={len(text)} "
               f"elapsed={monotonic() - started:.3f}s", flush=True)
         return Checkpoint(checkpoint_id=checkpoint_id, run_id=run_id, sequence=sequence, stage=stage,
@@ -173,7 +175,7 @@ class ResearchRunStore:
 
     def load_latest_checkpoint(self, run_id: str) -> Checkpoint:
         run = self.get_run(run_id)
-        if run.state_version != STATE_VERSION:
+        if run.state_version not in {1, STATE_VERSION}:
             raise IncompatibleCheckpointError(f"Research run state_version={run.state_version} is incompatible.")
         if run.last_checkpoint_id is None:
             raise NoCheckpointError("No checkpoint available for this run.")
@@ -182,6 +184,8 @@ class ResearchRunStore:
         if row is None or row["run_id"] != run_id:
             raise StateIntegrityError("Latest checkpoint is missing or belongs to another run.")
         state = state_from_json(row["state_json"])
+        if state.resources.run_id and state.resources.run_id != run_id:
+            raise StateIntegrityError("Checkpoint resource Run ID does not match its ResearchRun.")
         if state.goal != run.goal:
             raise StateIntegrityError("Latest checkpoint goal does not match its run.")
         return Checkpoint(**{key: row[key] for key in ("checkpoint_id", "run_id", "sequence", "stage", "created_at")}, state=state)

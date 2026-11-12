@@ -71,3 +71,34 @@ class CheckpointManager:
                 future.set_exception(error)
         self.loop.call_soon_threadsafe(run)
         return future.result()
+
+    def reserve_resources(self, run_id, skills, record):
+        """Persist permits/private references against the last safe graph only."""
+        future = Future()
+        def persist():
+            try:
+                if self.closed or run_id != self.run_id:
+                    raise RuntimeError("Research resource run is no longer active.")
+                state = self.safe_state.model_copy(deep=True)
+                previous = state.resources.tasks.get(record.task_id)
+                if previous is not None and previous.revision >= record.revision:
+                    future.set_result(None)
+                    return
+                state.resources.run_id = run_id
+                state.resources.skills = dict(skills)
+                state.resources.tasks[record.task_id] = record.model_copy(deep=True)
+                supplemental = any(task.id == record.task_id for plan in state.reresearch_summary.plans for task in plan.tasks)
+                prefix = "RERESEARCH_RESOURCE_RESERVED" if supplemental else "TASK_RESOURCE_RESERVED"
+                self.save(f"{prefix}:{record.task_id}", state)
+                future.set_result(None)
+            except BaseException as error:
+                future.set_exception(error)
+        try:
+            on_loop = asyncio.get_running_loop() is self.loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            persist()
+        else:
+            self.loop.call_soon_threadsafe(persist)
+        return future.result()

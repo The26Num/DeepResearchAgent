@@ -122,6 +122,18 @@ def test_docker_start_stream_restart_and_checkpoint_resume(tmp_path):
             assert_chain(graph)
             assert client.get(f"/runs/{run_id}/report").text == index
 
+            # Production non-root user, packaged methods, and the same /data
+            # volume as SQLite. No model/network calls or real deployment files.
+            archive_manifest = compose("exec", "-T", "backend", "python", "-c",
+                "import json, os; from app.research.source_archive import SourceArchive; "
+                "from app.research.skills import SkillRegistry; "
+                "root=os.environ['SOURCE_ARCHIVE_PATH']; assert root=='/data/source_archive'; "
+                "archive=SourceArchive(root,'deployment_archive_fixture'); "
+                "ref=archive.put(requested_url='https://example.org/fixture',url='https://example.org/fixture',"
+                "title='Offline deployment',raw=b'<main>persistent source</main>',text='persistent source',task_id='D'); "
+                "pins=SkillRegistry(root,archive.run_id).pin(); assert len(pins)==3; "
+                "print(json.dumps({'ref':ref.model_dump(mode='json'),'pins':{k:v.model_dump(mode='json') for k,v in pins.items()}}))").strip()
+
             paused = client.post("/api/runs", json={"question": "deployment pause"}).json()["run_id"]
             def at_analysis():
                 run = client.get(f"/api/runs/{paused}").json()
@@ -150,6 +162,14 @@ def test_docker_start_stream_restart_and_checkpoint_resume(tmp_path):
             assert client.get(f"/api/runs/{run_id}/report").json() == report
             assert client.get(f"/api/runs/{run_id}/evidence").json() == graph
             assert client.get(f"/api/runs/{paused}").json()["status"] == "COMPLETED"
+            compose("exec", "-T", "backend", "python", "-c",
+                "import json,os,sys; from app.research.source_archive import SourceArchive; "
+                "from app.research.resource_models import SnapshotRef,SkillPin; from app.research.skills import SkillRegistry; "
+                "data=json.loads(sys.argv[1]); ref=SnapshotRef.model_validate(data['ref']); "
+                "root=os.environ['SOURCE_ARCHIVE_PATH']; archive=SourceArchive(root,ref.run_id); "
+                "assert archive.read(ref)[0]=='persistent source'; "
+                "registry=SkillRegistry(root,ref.run_id,pins={k:SkillPin.model_validate(v) for k,v in data['pins'].items()}); "
+                "registry.validate(); assert registry.read('academic_review')", archive_manifest)
             assert client.post(f"/api/runs/{run_id}/resume").status_code == 409
             assert run_id in compose("exec", "-T", "backend", "python", "main.py", "--list-runs")
             compose("exec", "-T", "backend", "python", "-c", "from pathlib import Path; assert not Path('/app/.env').exists()")

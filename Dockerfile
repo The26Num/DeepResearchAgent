@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     API_HOST=0.0.0.0 \
     API_PORT=8000 \
-    RESEARCH_DB_PATH=/data/research.db
+    RESEARCH_DB_PATH=/data/research.db \
+    SOURCE_ARCHIVE_PATH=/data/source_archive
 
 WORKDIR /app
 COPY pyproject.toml README.md ./

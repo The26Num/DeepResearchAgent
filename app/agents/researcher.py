@@ -5,29 +5,29 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urldefrag
 
-from deepagents import (
-    GeneralPurposeSubagentProfile,
-    HarnessProfile,
-    create_deep_agent,
-    register_harness_profile,
-)
-from deepagents.middleware.filesystem import FilesystemMiddleware
+from langchain.agents import create_agent
+from langgraph.errors import GraphRecursionError
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.config import get_settings
 from app.research.budget_middleware import ResearchBudgetMiddleware
+from app.research.resource_middleware import ResearchContextMiddleware
+from app.research.resource_tools import resource_tools
+from app.research.task_resources import RunResources, ResearchBudgetExceeded, ResearchContextExceeded, estimated_tokens
+from app.llm import bounded_output_options
 from app.research.evidence_report import finalize_evidence_report
 from app.research.discovery_guard import readable_source_urls
 from app.research.context import build_dependency_context
 from app.research.evidence_context import EvidenceContext
-from app.research.evidence_extraction import EvidenceExtractor, build_evidence_bundle, prepare_extraction_payload
+from app.research.evidence_extraction import EvidenceExtractor, build_evidence_bundle, prepare_extraction_payload, source_fragments
 from app.research.tool_budget import ToolBudget, budgeted_tools
 from app.research.runtime import ResearchModelCallbacks, ResearchRuntime
 from app.schemas.research_result import CompactResearchResult, ResearchExecutionResult
 from app.schemas.task import ResearchTask
 from app.schemas.evidence_bundle import TaskEvidenceBundle
 from app.research.source_dedup import deduplicate_memo_sources, retain_memo_sections
+from app.research.reresearch_budget import ReResearchTaskBudgetExhausted
 from app.tools.fetch_webpage import fetch_webpage
 
 
@@ -41,27 +41,20 @@ MAX_AGENT_STEPS = 40
 class Researcher:
     def __init__(self, model: BaseChatModel, agent_factory: Callable[[ToolBudget], object] | None = None,
                  *, evidence_extractor: EvidenceExtractor | None = None) -> None:
-        # DeepAgents adds a general-purpose subagent by default. Phase 1 has
-        # neither subagents nor filesystem tools.
-        register_harness_profile(
-            "openai",
-            HarnessProfile(
-                general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-                excluded_tools={"read_file"},
-            ),
-        )
         self.model = model
         self.system_prompt = _PROMPT.read_text(encoding="utf-8")
         self._agent_factory = agent_factory or self._create_agent
         self._evidence_extractor = evidence_extractor or EvidenceExtractor(model)
 
     def _create_agent(self, budget: ToolBudget):
-        return create_deep_agent(
+        tools = budgeted_tools(budget) if budget.max_search_calls or budget.max_fetch_calls else []
+        if budget.resources:
+            tools.extend(resource_tools(budget))
+        return create_agent(
             model=self.model,
-            tools=budgeted_tools(budget) if budget.max_search_calls or budget.max_fetch_calls else [],
+            tools=tools,
             system_prompt=self.system_prompt,
-            middleware=[FilesystemMiddleware(tools=["read_file"]), ResearchBudgetMiddleware(budget)],
-            subagents=[],
+            middleware=[ResearchBudgetMiddleware(budget), ResearchContextMiddleware(budget)],
             checkpointer=None,
             store=None,
         ).with_config({
@@ -134,6 +127,9 @@ class Researcher:
                 "Compare previous results, remove repetitions, and extract agreement, differences, trends, and gaps. "
                 "在‘主要发现’下使用‘### 共识’和‘### 差异’，比较具名来源。"
                 "Use upstream Claims and Evidence only. Do not call web_search or fetch_webpage. "
+                "Supplied upstream chains are the primary factual input; they do not require more source-tool calls. "
+                "Use internal reading only to resolve a specific ambiguity, then finalize. "
+                "Do not repeatedly rediscover the same sources or try to consume the remaining tool budget. "
                 "If evidence cannot support a comparison, report it as uncertainty; do not invent a formal Claim."
             )
         context_urls = list(dict.fromkeys(_URL.findall(previous)))
@@ -150,13 +146,20 @@ class Researcher:
 
     def research(
         self, task: ResearchTask, context: dict[str, CompactResearchResult] | None = None, goal: str | None = None,
-        evidence_context: EvidenceContext | None = None,
+        evidence_context: EvidenceContext | None = None, resources=None,
     ) -> ResearchExecutionResult:
         settings = get_settings()
         runtime = ResearchRuntime(
             task.id, settings.research_task_timeout_seconds, settings.research_progress_interval_seconds,
         )
-        return runtime.run(lambda: self._research(task, context, goal, runtime, evidence_context or EvidenceContext()))
+        resources = resources or RunResources(settings).start_task(task)
+        runtime.task_resources = resources
+        resources.runtime = runtime
+        try:
+            with resources.activate():
+                return runtime.run(lambda: self._research(task, context, goal, runtime, evidence_context or EvidenceContext()))
+        finally:
+            resources.close()
 
     @staticmethod
     def _analysis_source_urls(context: dict[str, CompactResearchResult], previous: str) -> list[str]:
@@ -201,7 +204,7 @@ class Researcher:
                 successful.append({
                     "url": str(page.get("url") or url),
                     "title": str(page.get("title") or "")[:300],
-                    "text": text.strip()[:4000],
+                    "text": text if budget.resources else text.strip()[:4000],
                 })
             else:
                 failed.append({"url": url, "error": str(page.get("error") or "empty page body")[:240]})
@@ -223,6 +226,8 @@ class Researcher:
         available = min(12000, MAX_RESEARCH_INPUT_CHARS - len(self.system_prompt) - len(request) - len(header))
         payload = {"successful_readings": successful, "failed_readings": failed}
         while len(encoded := json.dumps(payload, ensure_ascii=False)) > available:
+            if budget.resources:
+                raise ValueError("Complete prefetched source previews do not fit the task input; no unread range was credited.")
             if all(len(item["text"]) <= 100 for item in successful):
                 raise ValueError("Research input budget cannot retain useful source readings; shorten the task or goal.")
             for item in successful:
@@ -265,22 +270,35 @@ class Researcher:
             "State specific gaps when these sources do not answer the question. "
             "Use the four required Chinese sections, including comparisons for synthesis.\n"
         )
-        readings = [{"url": page["url"], "title": page.get("title", ""), "text": page["text"][:4000]}
-                    for page in budget.readings[:4]]
+        resource = budget.resources
+        pages = resource.reading_pages() if resource else budget.readings
+        readings = []
+        groups = []
+        for page in reversed(pages):
+            pieces = [page["text"]] if len(page["text"]) <= 4000 else [item["content"] for item in reversed(source_fragments(page["text"], exact=True))]
+            groups.append([{ "url": page["url"], "title": page.get("title", ""), "text": text} for text in dict.fromkeys(pieces)])
+        while len(readings) < 4 and any(groups):
+            for group in groups:
+                if group and len(readings) < 4:
+                    readings.append(group.pop(0))
+        system = self.system_prompt + ("\nACTIVE RESEARCH METHODS:\n" + resource.method_text() if resource else "")
         while True:
             final_request = request + instruction + json.dumps({"successful_readings": readings}, ensure_ascii=False)
-            if len(self.system_prompt) + len(final_request) <= MAX_RESEARCH_INPUT_CHARS:
+            fits = len(system) + len(final_request) <= MAX_RESEARCH_INPUT_CHARS
+            if resource:
+                fits = fits and estimated_tokens([SystemMessage(content=system), HumanMessage(content=final_request)]) + resource.record.limits["output_tokens"] <= resource.record.limits["context_tokens"]
+            if fits:
                 break
-            if not any(len(page["text"]) > 100 for page in readings):
+            if not readings:
                 raise ValueError("Memo recovery input cannot retain source readings within the research input budget.")
-            for page in readings:
-                page["text"] = page["text"][:max(100, len(page["text"]) // 2)]
+            readings.pop()
         settings = get_settings()
         with runtime.operation("memo recovery 1/1"):
             response = self.model.invoke(
-                [SystemMessage(content=self.system_prompt), HumanMessage(content=final_request)],
-                config={"callbacks": [ResearchModelCallbacks(runtime)]},
+                [SystemMessage(content=system), HumanMessage(content=final_request)],
+                config={"callbacks": [ResearchModelCallbacks(runtime, purpose="memo_recovery")]},
                 timeout=min(settings.model_request_timeout_seconds, runtime.remaining()),
+                **bounded_output_options(self.model, resource.record.limits["output_tokens"] if resource else settings.research_model_max_tokens),
             )
         memo = self._memo_text(response)
         if not memo:
@@ -294,34 +312,65 @@ class Researcher:
         runtime.remaining()
         request, previous = self.build_request(task, context, goal, evidence_context)
         budget = ToolBudget.for_task(task)
+        budget.resources = runtime.task_resources
+        if budget.resources:
+            record = budget.resources.snapshot()
+            budget.max_search_calls = record.limits["web_search"]
+            budget.max_fetch_calls = record.limits["fetch_webpage"]
+            budget.search_calls = record.calls.get("web_search", 0)
+            budget.fetch_calls = record.calls.get("fetch_webpage", 0)
+            budget.calls = list(record.tool_history)
+            budget.readings = budget.resources.reading_pages()
+            budget.search_urls = list(record.search_urls)
+            if not record.estimated_token_budget_enforced:
+                runtime.log("cumulative estimated-token quota disabled; usage accounting and other limits remain active")
         budget.runtime = runtime
         budget.report = lambda progress: runtime.log(progress, "Tool progress")
         context_urls = list(dict.fromkeys(_URL.findall(previous)))
         thin_analysis_context = self._analysis_needs_reading(task, previous, evidence_context)
+        # Extraction/memo requests consume durable permits before invocation.
+        # After an interrupted finalization, restart from the saved *actual*
+        # readings, not a new research loop and another one-shot memo. The
+        # final public memo is still rendered only from validated formal Claims.
+        saved = budget.resources.snapshot() if budget.resources else None
+        resume_extraction = bool(saved and saved.attempts > 1
+            and (saved.model_calls.get("extraction", 0) or saved.model_calls.get("memo_recovery", 0)
+                 or (task.task_type == "synthesis" and saved.model_calls.get("researcher", 0)))
+            and (budget.readings or evidence_context.evidence)
+            and (task.task_type != "discovery" or budget.search_calls))
         if task.task_type == "analysis" and evidence_context.evidence:
             runtime.log("analysis reuse first; source tools remain available for missing detail")
-        if thin_analysis_context:
+        if thin_analysis_context and not resume_extraction:
             request = self._prepare_analysis_sources(task, request, context or {}, previous, budget)
         runtime.remaining()
-        agent = self._agent_factory(budget)
+        agent = None if resume_extraction else self._agent_factory(budget)
 
         def invoke(payload: dict):
             with runtime.operation("agent execution"):
-                return agent.invoke(payload)
+                try:
+                    return agent.invoke(payload)
+                except (ResearchBudgetExceeded, ResearchContextExceeded, ReResearchTaskBudgetExhausted, GraphRecursionError) as error:
+                    runtime.log(f"bounded agent stop: {type(error).__name__}; using reserved memo/extraction permits")
+                    reason = "context" if isinstance(error, ResearchContextExceeded) else "budget"
+                    return {"messages": [HumanMessage(content=request), AIMessage(content="", response_metadata={"finish_reason": reason})]}
 
-        result = invoke({"messages": [{"role": "user", "content": request}]})
+        if resume_extraction:
+            runtime.log("resuming evidence extraction from saved readings; no repeated research or memo request")
+            result = {"messages": [HumanMessage(content=request), AIMessage(content="")]}
+        else:
+            result = invoke({"messages": [{"role": "user", "content": request}]})
         messages = result.get("messages", [])
         if not messages:
             raise RuntimeError(f"Researcher returned no messages for task {task.id}.")
 
         observed_messages = list(messages)
-        if task.task_type == "discovery" and not any(
+        if task.task_type == "discovery" and not budget.search_calls and not any(
             isinstance(message, ToolMessage) and message.name == "web_search" for message in observed_messages
         ):
             reminder = "This is a discovery task. Call web_search for new sources before finalizing the CURRENT TASK memo."
             messages = invoke({"messages": [*messages, HumanMessage(content=reminder)]}).get("messages", [])
             observed_messages.extend(messages)
-            if not messages or not any(isinstance(message, ToolMessage) and message.name == "web_search" for message in observed_messages):
+            if not messages or (not budget.search_calls and not any(isinstance(message, ToolMessage) and message.name == "web_search" for message in observed_messages)):
                 raise RuntimeError(f"Researcher did not search for new sources for discovery task {task.id}.")
 
         search_urls: list[str] = []
@@ -337,7 +386,7 @@ class Researcher:
                     search_urls.extend(item["url"] for item in search_result.get("results", []) if item.get("url"))
                 except (TypeError, ValueError, KeyError):
                     pass
-        candidate_urls = search_urls or (context_urls if task.task_type == "discovery" else [])
+        candidate_urls = search_urls or budget.search_urls or (context_urls if task.task_type == "discovery" else [])
         if candidate_urls and not budget.readings and budget.fetch_calls < budget.max_fetch_calls:
             reminder = (
                 "No source page has been successfully read; failed/PDF fetches are not evidence. "
@@ -402,6 +451,16 @@ class Researcher:
         if unread_discovery:
             runtime.log("discovery incomplete: no successful readings; withholding unsupported memo")
             memo = ""  # Ignore even a nonempty but unsupported agent memo.
+        elif resume_extraction or (runtime.call_budget is not None and runtime.call_budget.has_task_allocation(task.id)):
+            # No reconstructed draft is treated as a factual source. Extraction
+            # can select only exact saved readings and authorized upstream chains.
+            if not memo or recovered_reading:
+                last = messages[-1]
+                if (getattr(last, "response_metadata", {}).get("finish_reason") == "content_filter"
+                        or getattr(last, "additional_kwargs", {}).get("refusal")):
+                    raise RuntimeError(f"Researcher memo was refused by the model for task {task.id}.")
+                runtime.log("finalizing evidence from saved readings; no extra memo model request")
+                memo = ""
         elif not memo or recovered_reading:
             memo = self._recover_memo(task, context, goal, budget, evidence_context, runtime, messages[-1])
             # A possible synthesis-format follow-up must not replay unfinished
@@ -417,7 +476,7 @@ class Researcher:
         # Synthesis has no new reading/extraction channel; formal Claims must
         # resolve to the supplied upstream Evidence, including with test adapters.
         readings = [] if task.task_type == "synthesis" else budget.readings
-        payload = prepare_extraction_payload(task, memo, readings, evidence_context)
+        payload = prepare_extraction_payload(task, memo, readings, evidence_context, resources=budget.resources)
         if not unread_discovery and (payload["fetched_pages"] or evidence_context.evidence):
             with runtime.operation("evidence extraction"):
                 extracted = self._evidence_extractor.extract(payload, runtime)

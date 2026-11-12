@@ -13,6 +13,7 @@ services:
       API_MAX_CONCURRENT_RUNS: "1"
       API_CORS_ORIGINS: "[]"
       RESEARCH_DB_PATH: /data/research.db
+      SOURCE_ARCHIVE_PATH: /data/source_archive
     volumes:
       - research_data:/data
     expose:

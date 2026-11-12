@@ -16,9 +16,10 @@ def test_html_title_and_main_text_are_extracted(monkeypatch) -> None:
         def raise_for_status(self) -> None:
             pass
 
-    def fake_get(url: str, headers: dict[str, str], timeout: int) -> Response:
+    def fake_get(url: str, headers: dict[str, str], timeout: int, **kwargs) -> Response:
         assert timeout == 15
         assert "User-Agent" in headers
+        assert kwargs == {"stream": True, "allow_redirects": False}
         return Response()
 
     monkeypatch.setattr(fetch_module.requests, "get", fake_get)
@@ -33,7 +34,7 @@ def test_html_title_and_main_text_are_extracted(monkeypatch) -> None:
 
 
 def test_http_error_is_clear(monkeypatch) -> None:
-    def fake_get(url: str, headers: dict[str, str], timeout: int) -> None:
+    def fake_get(url: str, headers: dict[str, str], timeout: int, **kwargs) -> None:
         raise requests.HTTPError("503 Service Unavailable")
 
     monkeypatch.setattr(fetch_module.requests, "get", fake_get)

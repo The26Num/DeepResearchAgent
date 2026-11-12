@@ -34,13 +34,13 @@ export function stageLabel(stage: string): string {
   const [base, task] = stage.split(':');
   const labels: Record<string, string> = {
     RUN_CREATED: '准备研究', PLANNING: '制定研究计划', PLAN_CREATED: '研究计划已生成',
-    INITIAL_RESEARCH_BATCH: '执行研究任务', TASK_RESEARCH_COMPLETED: '任务研究已完成',
+    INITIAL_RESEARCH_BATCH: '执行研究任务', TASK_RESEARCH_COMPLETED: '任务研究已完成', TASK_RESOURCE_RESERVED: '执行研究任务',
     TASK_VERIFICATION: '验证任务结论', TASK_COMPLETED: '任务已完成', INITIAL_RESEARCH_COMPLETED: '初轮研究已完成',
     GAP_DETECTION: '识别研究缺口', RELEVANCE_BATCH_COMPLETED: '相关性检查已更新', GAP_DETECTION_COMPLETED: '缺口识别已完成',
     RERESEARCH: '执行补充研究', RERESEARCH_STARTED: '补充研究已启动', RERESEARCH_CALL_RESERVED: '执行补充研究',
     RERESEARCH_COMPLETED: '补充研究已完成', WRITER: '撰写研究报告', WRITER_COMPLETED: '报告已保存',
     RERESEARCH_PLAN_CREATED: '补充研究计划已保存', RERESEARCH_TASK_RESEARCH_COMPLETED: '补充任务研究已返回',
-    RERESEARCH_TASK_COMPLETED: '补充任务已完成',
+    RERESEARCH_TASK_COMPLETED: '补充任务已完成', RERESEARCH_RESOURCE_RESERVED: '执行补充研究任务',
     CITATION: '整理来源引用', CITATION_COMPLETED: '引用整理已完成', RUN_COMPLETED: '研究已完成',
   };
   return (labels[base] || base) + (task ? ` · ${task}` : '');
